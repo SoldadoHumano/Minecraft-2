@@ -13,6 +13,9 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:C,CXX>:/WX->
         $<$<COMPILE_LANGUAGE:C,CXX>:/arch:AVX2>
     )
+    # Force /Ob1 in Release to prevent aggressive inlining bugs with volk dispatch
+    string(REPLACE "/Ob2" "/Ob1" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
+    string(REPLACE "/Ob2" "/Ob1" CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE}")
 else()
     add_compile_options(-Wall -Wextra -pthread)
 endif()
@@ -81,6 +84,15 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(volk)
 
+# Dear ImGui
+message(STATUS "Fetching ImGui...")
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        v1.90.8
+)
+FetchContent_MakeAvailable(imgui)
+
 # Ensure volk can find Vulkan headers
 target_link_libraries(volk PUBLIC Vulkan::Headers)
 
@@ -93,7 +105,20 @@ file(GLOB_RECURSE HEADER_FILES "src/*.h" "src/*.hpp")
 
 add_executable(${PROJECT_NAME} ${SRC_FILES} ${HEADER_FILES})
 
-target_include_directories(${PROJECT_NAME} PRIVATE src)
+target_include_directories(${PROJECT_NAME} PRIVATE 
+    src 
+    ${imgui_SOURCE_DIR} 
+    ${imgui_SOURCE_DIR}/backends
+)
+
+target_sources(${PROJECT_NAME} PRIVATE
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
+)
 
 # Link dependencies
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -109,3 +134,5 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 if(NOT MSVC)
     target_link_libraries(${PROJECT_NAME} PRIVATE pthread)
 endif()
+
+target_compile_definitions(${PROJECT_NAME} PRIVATE IMGUI_IMPL_VULKAN_USE_VOLK)

@@ -1,13 +1,21 @@
 .data
-c_255   DD 8 DUP(255)
 c_1     DD 8 DUP(1)
-c_2     DD 8 DUP(2)
-c_3     DD 8 DUP(3)
 c_6     real4 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0
 c_15    real4 15.0, 15.0, 15.0, 15.0, 15.0, 15.0, 15.0, 15.0
 c_10    real4 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0
-c_sign  DD 8 DUP(080000000h)
 c_1f    real4 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
+
+; Hash constants
+c_prime1 DD 8 DUP(374761393)
+c_prime2 DD 8 DUP(668265263)
+c_prime3 DD 8 DUP(1274126177)
+c_mask7  DD 8 DUP(7)
+
+; Gradient tables for LUT (vpermps)
+; Indices 0 to 7 correspond to 8 unique 2D gradients for Perlin
+; (1,1), (-1,1), (1,-1), (-1,-1), (1,0), (-1,0), (0,1), (0,-1)
+c_gradX real4 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 0.0, 0.0
+c_gradY real4 1.0, 1.0, -1.0, -1.0, 0.0, 0.0, 1.0, -1.0
 
 .code
 
@@ -33,39 +41,29 @@ LERP_MACRO MACRO a, t, b, t1
     vaddps a, a, t1
 ENDM
 
-GRAD_MACRO MACRO dest, hash, x, y, t1, t2, t3
-    vmovdqu t1, ymmword ptr [c_3]
-    vpand t1, hash, t1
-    
-    vmovdqu t2, ymmword ptr [c_2]
-    vpcmpgtd t2, t2, t1
-    
-    vblendvps t3, y, x, t2
-    vblendvps dest, x, y, t2
-    
-    vmovdqu t2, ymmword ptr [c_1]
-    vpand t2, t1, t2
-    vpxor t1, t1, t1
-    vpcmpeqd t2, t2, t1
-    
-    vmovups t1, ymmword ptr [c_sign]
-    vxorps t1, t3, t1
-    vblendvps t3, t1, t3, t2
-    
-    vmovdqu t1, ymmword ptr [c_3]
-    vpand t1, hash, t1
-    vmovdqu t2, ymmword ptr [c_2]
-    vpand t2, t1, t2
-    vpxor t1, t1, t1
-    vpcmpeqd t2, t2, t1
-    
-    vmovups t1, ymmword ptr [c_sign]
-    vxorps t1, dest, t1
-    vblendvps dest, t1, dest, t2
-    
-    vaddps dest, dest, t3
+HASH_MACRO MACRO dest, x, y, t1, seed
+    vpmulld dest, x, ymmword ptr [c_prime1]
+    vpmulld t1, y, ymmword ptr [c_prime2]
+    vpaddd dest, dest, t1
+    vpaddd dest, dest, seed
+    vpsrld t1, dest, 13
+    vpxor dest, dest, t1
+    vpmulld dest, dest, ymmword ptr [c_prime3]
+    vpand dest, dest, ymmword ptr [c_mask7]
 ENDM
 
+GRAD_MACRO MACRO dest, hash, dx, dy, t1, t2
+    vpermps t1, hash, ymmword ptr [c_gradX]
+    vpermps t2, hash, ymmword ptr [c_gradY]
+    vmulps t1, t1, dx
+    vmulps t2, t2, dy
+    vaddps dest, t1, t2
+ENDM
+
+; rcx = out_noise
+; rdx = in_x
+; r8  = in_y
+; r9d = seed
 Noise2D_AVX2_ASM PROC
     sub rsp, 168
     movaps xmmword ptr [rsp + 0], xmm6
@@ -79,67 +77,55 @@ Noise2D_AVX2_ASM PROC
     movaps xmmword ptr [rsp + 128], xmm14
     movaps xmmword ptr [rsp + 144], xmm15
 
-    vmovups ymm0, ymmword ptr [rdx]
-    vmovups ymm1, ymmword ptr [r8]
+    vmovups ymm0, ymmword ptr [rdx] ; in_x
+    vmovups ymm1, ymmword ptr [r8]  ; in_y
     
-    vroundps ymm2, ymm0, 1
-    vroundps ymm3, ymm1, 1
+    ; Broadcast seed to ymm13
+    vmovd xmm13, r9d
+    vpbroadcastd ymm13, xmm13
     
-    vcvtps2dq ymm4, ymm2
-    vcvtps2dq ymm5, ymm3
+    vroundps ymm2, ymm0, 1 ; floor(x)
+    vroundps ymm3, ymm1, 1 ; floor(y)
     
-    vmovdqu ymm6, ymmword ptr [c_255]
-    vpand ymm4, ymm4, ymm6
-    vpand ymm5, ymm5, ymm6
+    vcvtps2dq ymm4, ymm2 ; X integer
+    vcvtps2dq ymm5, ymm3 ; Y integer
     
-    vsubps ymm0, ymm0, ymm2
-    vsubps ymm1, ymm1, ymm3
+    ; dx, dy
+    vsubps ymm0, ymm0, ymm2 ; dx
+    vsubps ymm1, ymm1, ymm3 ; dy
     
-    FADE_MACRO ymm2, ymm0, ymm6, ymm7
-    FADE_MACRO ymm3, ymm1, ymm6, ymm7
+    ; u, v (using ymm2 and ymm3 to store u and v)
+    FADE_MACRO ymm2, ymm0, ymm6, ymm7 ; ymm2 = u
+    FADE_MACRO ymm3, ymm1, ymm6, ymm7 ; ymm3 = v
     
-    vpcmpeqd ymm15, ymm15, ymm15
-    vpgatherdd ymm6, dword ptr [r9 + ymm4 * 4], ymm15
-    vpaddd ymm6, ymm6, ymm5
-    
+    ; X+1, Y+1
     vmovdqu ymm14, ymmword ptr [c_1]
-    vpaddd ymm7, ymm4, ymm14
-    vpcmpeqd ymm15, ymm15, ymm15
-    vpgatherdd ymm8, dword ptr [r9 + ymm7 * 4], ymm15
-    vpaddd ymm7, ymm8, ymm5
+    vpaddd ymm6, ymm4, ymm14 ; ymm6 = X+1
+    vpaddd ymm7, ymm5, ymm14 ; ymm7 = Y+1
     
-    vpaddd ymm8, ymm6, ymm14
-    vpaddd ymm9, ymm7, ymm14
+    ; Hashes
+    HASH_MACRO ymm8, ymm4, ymm5, ymm15, ymm13  ; h00
+    HASH_MACRO ymm9, ymm6, ymm5, ymm15, ymm13  ; h10
+    HASH_MACRO ymm10, ymm4, ymm7, ymm15, ymm13 ; h01
+    HASH_MACRO ymm11, ymm6, ymm7, ymm15, ymm13 ; h11
     
-    vpcmpeqd ymm15, ymm15, ymm15
-    vpgatherdd ymm10, dword ptr [r9 + ymm6 * 4], ymm15
+    ; Gradients
+    vmovups ymm12, ymmword ptr [c_1f]
+    vsubps ymm14, ymm0, ymm12 ; dx - 1
+    vsubps ymm15, ymm1, ymm12 ; dy - 1
     
-    vpcmpeqd ymm15, ymm15, ymm15
-    vpgatherdd ymm11, dword ptr [r9 + ymm7 * 4], ymm15
+    ; GRAD_MACRO dest, hash, dx, dy, t1, t2
+    GRAD_MACRO ymm4, ymm8, ymm0, ymm1, ymm5, ymm6    ; g00 -> ymm4
+    GRAD_MACRO ymm7, ymm9, ymm14, ymm1, ymm5, ymm6   ; g10 -> ymm7
+    GRAD_MACRO ymm8, ymm10, ymm0, ymm15, ymm5, ymm6  ; g01 -> ymm8
+    GRAD_MACRO ymm9, ymm11, ymm14, ymm15, ymm5, ymm6 ; g11 -> ymm9
     
-    vpcmpeqd ymm15, ymm15, ymm15
-    vpgatherdd ymm12, dword ptr [r9 + ymm8 * 4], ymm15
+    ; Lerp
+    LERP_MACRO ymm4, ymm2, ymm7, ymm12 ; lerp u: g00, g10 -> ymm4
+    LERP_MACRO ymm8, ymm2, ymm9, ymm12 ; lerp u: g01, g11 -> ymm8
+    LERP_MACRO ymm4, ymm3, ymm8, ymm12 ; lerp v: ymm4, ymm8 -> ymm4 (final)
     
-    vpcmpeqd ymm15, ymm15, ymm15
-    vpgatherdd ymm13, dword ptr [r9 + ymm9 * 4], ymm15
-    
-    GRAD_MACRO ymm6, ymm10, ymm0, ymm1, ymm7, ymm8, ymm9
-    
-    vmovups ymm10, ymmword ptr [c_1f]
-    vsubps ymm14, ymm0, ymm10
-    GRAD_MACRO ymm7, ymm11, ymm14, ymm1, ymm8, ymm9, ymm10
-    
-    vmovups ymm10, ymmword ptr [c_1f]
-    vsubps ymm15, ymm1, ymm10
-    GRAD_MACRO ymm8, ymm12, ymm0, ymm15, ymm9, ymm10, ymm11
-    
-    GRAD_MACRO ymm9, ymm13, ymm14, ymm15, ymm10, ymm11, ymm12
-    
-    LERP_MACRO ymm6, ymm2, ymm7, ymm10
-    LERP_MACRO ymm8, ymm2, ymm9, ymm10
-    LERP_MACRO ymm6, ymm3, ymm8, ymm10
-    
-    vmovups ymmword ptr [rcx], ymm6
+    vmovups ymmword ptr [rcx], ymm4
     
     vzeroupper
     

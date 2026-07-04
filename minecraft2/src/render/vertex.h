@@ -4,7 +4,7 @@
 namespace mc::render {
 
 struct Vertex {
-    uint32_t data;
+  uint32_t data;
 };
 
 } // namespace mc::render

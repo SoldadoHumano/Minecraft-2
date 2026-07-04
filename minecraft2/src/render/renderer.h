@@ -1,124 +1,140 @@
 #pragma once
-#include "vulkan_context.h"
 #include "../core/camera.h"
 #include "../core/metrics.h"
 #include "debug_ui.h"
 #include "vertex.h"
-#include <vector>
+#include "vulkan_context.h"
+#include "vulkan_swapchain.h"
+#include "free_list_allocator.h"
+#include "vulkan_pipeline.h"
+#include "vulkan_buffer.h"
 #include <glm/glm.hpp>
 #include <memory>
-#include <unordered_map>
 #include <mutex>
+#include <unordered_map>
+#include <vector>
 #define GLM_ENABLE_EXPERIMENTAL
-#include <glm/gtx/hash.hpp>
 #include "../world/chunk_manager.h"
+#include <glm/gtx/hash.hpp>
 
 namespace mc::render {
 
 struct UniformBufferObject {
-    glm::mat4 model;
-    glm::mat4 view;
-    glm::mat4 proj;
+  glm::mat4 model;
+  glm::mat4 view;
+  glm::mat4 proj;
 };
+
+
 
 class Renderer {
 public:
-    Renderer(VulkanContext& context, uint32_t width, uint32_t height);
-    ~Renderer();
+  Renderer(VulkanContext &context, uint32_t width, uint32_t height);
+  ~Renderer();
 
-    bool DrawFrame(const mc::core::Camera& camera, float time, mc::core::EngineMetrics& metrics);
-    
-    void UploadMeshAsync(const mc::world::ChunkMesh& mesh);
-    void UnloadChunk(int cx, int cz);
-    void ProcessPendingChunks();
-    
-    bool HandleClick(double x, double y, mc::core::EngineMetrics& metrics);
-    void HandleDrag(double x, double y, mc::core::EngineMetrics& metrics);
-    void WaitIdle();
-    
-    void RecreateSwapchain(int width, int height);
+  bool DrawFrame(const mc::core::Camera &camera, float time,
+                 mc::core::EngineMetrics &metrics);
+
+  void UploadMeshAsync(const mc::world::ChunkMesh &mesh);
+  void UnloadChunk(int cx, int cz);
+  void ProcessPendingChunks();
+
+  void WaitIdle();
+
+  void RecreateSwapchain(int width, int height);
 
 private:
-    VulkanContext& m_context;
-    uint32_t m_width, m_height;
+  VulkanContext &m_context;
+  uint32_t m_width, m_height;
 
-    VkSwapchainKHR m_swapchain = VK_NULL_HANDLE;
-    std::vector<VkImage> m_swapchainImages;
-    VkFormat m_swapchainImageFormat;
-    VkExtent2D m_swapchainExtent;
-    std::vector<VkImageView> m_swapchainImageViews;
+  std::unique_ptr<VulkanSwapchain> m_swapchain;
+  VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
+  VkPipeline m_graphicsPipeline = VK_NULL_HANDLE;
+  VkCommandPool m_commandPool = VK_NULL_HANDLE;
+  std::vector<VkCommandBuffer> m_commandBuffers;
 
-    VkImage m_depthImage = VK_NULL_HANDLE;
-    VkDeviceMemory m_depthImageMemory = VK_NULL_HANDLE;
-    VkImageView m_depthImageView = VK_NULL_HANDLE;
+  VkSemaphore m_imageAvailableSemaphore = VK_NULL_HANDLE;
+  VkSemaphore m_renderFinishedSemaphore = VK_NULL_HANDLE;
+  VkFence m_inFlightFence = VK_NULL_HANDLE;
 
-    VkRenderPass m_renderPass = VK_NULL_HANDLE;
-    VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_graphicsPipeline = VK_NULL_HANDLE;
+  struct ChunkRenderData {
+    int x, y, z;
+    int minY, maxY;
+    FreeListAllocator::Allocation vertexAllocation;
+    FreeListAllocator::Allocation indexAllocation;
+    uint32_t indexCount = 0;
+    uint32_t queryIndex = 0;
+    bool isVisible = true;
+  };
+  std::unordered_map<glm::ivec3, ChunkRenderData> m_chunkRenderData;
 
-    std::vector<VkFramebuffer> m_swapchainFramebuffers;
-    VkCommandPool m_commandPool = VK_NULL_HANDLE;
-    std::vector<VkCommandBuffer> m_commandBuffers;
+  std::vector<ChunkRenderData> m_readyRenderData;
+  std::mutex m_readyRenderDataMutex;
 
-    VkSemaphore m_imageAvailableSemaphore = VK_NULL_HANDLE;
-    VkSemaphore m_renderFinishedSemaphore = VK_NULL_HANDLE;
-    VkFence m_inFlightFence = VK_NULL_HANDLE;
+  std::vector<glm::ivec3> m_deletionQueue;
+  std::mutex m_deletionQueueMutex;
 
-    struct ChunkRenderData {
-        int x, y, z;
-        VkBuffer vertexBuffer = VK_NULL_HANDLE;
-        VkDeviceMemory vertexBufferMemory = VK_NULL_HANDLE;
-        VkBuffer indexBuffer = VK_NULL_HANDLE;
-        VkDeviceMemory indexBufferMemory = VK_NULL_HANDLE;
-        uint32_t indexCount = 0;
-        int minY = 0;
-        int maxY = 256;
-    };
-    std::unordered_map<glm::ivec3, ChunkRenderData> m_chunkRenderData;
-    
-    std::vector<ChunkRenderData> m_readyRenderData;
-    std::mutex m_readyRenderDataMutex;
-    
-    std::vector<glm::ivec3> m_deletionQueue;
-    std::mutex m_deletionQueueMutex;
-    
-    std::mutex m_commandPoolMutex;
-    std::mutex m_graphicsQueueMutex;
+  struct BufferGarbage {
+    FreeListAllocator::Allocation vertexAlloc;
+    FreeListAllocator::Allocation indexAlloc;
+  };
+  std::vector<BufferGarbage> m_garbageQueue;
 
-    VkBuffer m_uniformBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory m_uniformBufferMemory = VK_NULL_HANDLE;
-    void* m_uniformBufferMapped = nullptr;
+  std::mutex m_commandPoolMutex;
+  std::mutex m_graphicsQueueMutex;
 
-    VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
-    VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSet m_descriptorSet = VK_NULL_HANDLE;
+  // Global buffers
+  VkBuffer m_globalVertexBuffer = VK_NULL_HANDLE;
+  VkDeviceMemory m_globalVertexBufferMemory = VK_NULL_HANDLE;
+  FreeListAllocator m_vertexAllocator;
 
-    // Initialization helpers
-    void CreateSwapchain();
-    void CreateImageViews();
-    void CreateRenderPass();
-    void CreateDepthResources();
-    VkFormat FindSupportedFormat(const std::vector<VkFormat>& candidates, VkImageTiling tiling, VkFormatFeatureFlags features);
-    VkFormat FindDepthFormat();
-    void CreateDescriptorSetLayout();
-    void CreateGraphicsPipeline();
-    void CreateFramebuffers();
-    void CreateCommandPool();
-    void CreateCommandBuffers();
-    void CreateSyncObjects();
+  VkBuffer m_globalIndexBuffer = VK_NULL_HANDLE;
+  VkDeviceMemory m_globalIndexBufferMemory = VK_NULL_HANDLE;
+  FreeListAllocator m_indexAllocator;
 
-    // Buffer helpers
-    void CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory);
-    void CopyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size);
-    
-    void CreateUniformBuffers();
-    void CreateDescriptorPool();
-    void CreateDescriptorSets();
+  // Staging buffers for concurrent uploading
+  VkCommandPool m_uploadCommandPool = VK_NULL_HANDLE;
 
-    void RecordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex, const mc::core::Camera& camera, float time, mc::core::EngineMetrics& metrics);
-    VkShaderModule CreateShaderModule(const std::vector<uint32_t>& code);
+  VkBuffer m_uniformBuffer = VK_NULL_HANDLE;
+  VkDeviceMemory m_uniformBufferMemory = VK_NULL_HANDLE;
+  void *m_uniformBufferMapped = nullptr;
 
-    std::unique_ptr<DebugUI> m_debugUI;
+  VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
+  VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
+  VkDescriptorPool m_imguiDescriptorPool = VK_NULL_HANDLE;
+  VkDescriptorSet m_descriptorSet = VK_NULL_HANDLE;
+
+  // Occlusion Culling
+  VkQueryPool m_queryPool = VK_NULL_HANDLE;
+  std::vector<uint32_t> m_freeQueryIndices;
+  std::vector<uint32_t> m_queryResults;
+  std::vector<uint32_t> m_issuedQueries;
+  bool m_queriesIssued = false;
+  VkPipelineLayout m_aabbPipelineLayout = VK_NULL_HANDLE;
+  VkPipeline m_aabbPipeline = VK_NULL_HANDLE;
+  VkBuffer m_aabbVertexBuffer = VK_NULL_HANDLE;
+  VkDeviceMemory m_aabbVertexBufferMemory = VK_NULL_HANDLE;
+  VkBuffer m_aabbIndexBuffer = VK_NULL_HANDLE;
+  VkDeviceMemory m_aabbIndexBufferMemory = VK_NULL_HANDLE;
+
+  // Initialization helpers
+  void CreateDescriptorSetLayout();
+  void CreateCommandPool();
+  void CreateCommandBuffers();
+  void CreateSyncObjects();
+  void CreateGlobalBuffers();
+  void CreateQueryPool();
+  void CreateAABBBuffer();
+
+  void CreateUniformBuffers();
+  void CreateDescriptorPool();
+  void CreateDescriptorSets();
+
+  void RecordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex,
+                           const mc::core::Camera &camera, float time,
+                           mc::core::EngineMetrics &metrics);
+
+  std::unique_ptr<DebugUI> m_debugUI;
 };
 
 } // namespace mc::render
