@@ -12,9 +12,11 @@ struct EngineMetrics {
   uint32_t chunksLoaded = 0;
   uint32_t chunksRendered = 0;
   bool showF3 = false;
+  bool showProfiler = false;
   bool isPaused = false;
   bool showSettings = false;
   int viewDistance = 12;
+  bool enableRaytracing = false;
 
   // System Metrics
   float ramUsageMB = 0.0f;

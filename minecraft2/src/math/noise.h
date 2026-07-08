@@ -1,6 +1,5 @@
 #pragma once
 #include <cstdint>
-#include <immintrin.h>
 
 namespace mc::math {
 
@@ -19,7 +18,7 @@ public:
                   float lacunarity = 2.0f) const;
 
   // AVX2 SIMD Versions (8 floats at once)
-  __m256 Fractal2D_AVX2(__m256 x, __m256 y, int octaves = 4,
+  void Fractal2D_AVX2(float* out_val, const float* x, const float* y, int octaves = 4,
                         float persistence = 0.5f,
                         float lacunarity = 2.0f) const;
 

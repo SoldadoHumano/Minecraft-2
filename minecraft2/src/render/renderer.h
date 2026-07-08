@@ -8,6 +8,9 @@
 #include "free_list_allocator.h"
 #include "vulkan_pipeline.h"
 #include "vulkan_buffer.h"
+#include "texture_manager.h"
+#include "skybox/skybox_renderer.h"
+#include "raytracing/vulkan_raytracer.h"
 #include <glm/glm.hpp>
 #include <memory>
 #include <mutex>
@@ -33,11 +36,12 @@ public:
   ~Renderer();
 
   bool DrawFrame(const mc::core::Camera &camera, float time,
-                 mc::core::EngineMetrics &metrics);
+                 mc::core::EngineMetrics &metrics, mc::world::ChunkManager &chunkManager);
+
 
   void UploadMeshAsync(const mc::world::ChunkMesh &mesh);
   void UnloadChunk(int cx, int cz);
-  void ProcessPendingChunks();
+  void ProcessPendingChunks(VkCommandBuffer commandBuffer, uint32_t imageIndex);
 
   void WaitIdle();
 
@@ -56,6 +60,39 @@ private:
   VkSemaphore m_imageAvailableSemaphore = VK_NULL_HANDLE;
   VkSemaphore m_renderFinishedSemaphore = VK_NULL_HANDLE;
   VkFence m_inFlightFence = VK_NULL_HANDLE;
+
+  // Offscreen HDR Render Target
+  VkImage m_offscreenColorImage = VK_NULL_HANDLE;
+  VkDeviceMemory m_offscreenColorMemory = VK_NULL_HANDLE;
+  VkImageView m_offscreenColorView = VK_NULL_HANDLE;
+  
+  VkImage m_offscreenDepthImage = VK_NULL_HANDLE;
+  VkDeviceMemory m_offscreenDepthMemory = VK_NULL_HANDLE;
+  VkImageView m_offscreenDepthView = VK_NULL_HANDLE;
+  
+  VkRenderPass m_mainRenderPass = VK_NULL_HANDLE;
+  VkFramebuffer m_mainFramebuffer = VK_NULL_HANDLE;
+  
+  // Blur Pass Render Target (Ping-pong buffer for separable blur)
+  VkImage m_blurImage = VK_NULL_HANDLE;
+  VkDeviceMemory m_blurMemory = VK_NULL_HANDLE;
+  VkImageView m_blurView = VK_NULL_HANDLE;
+  
+  VkRenderPass m_blurRenderPass = VK_NULL_HANDLE;
+  VkFramebuffer m_blurFramebuffer = VK_NULL_HANDLE;
+  
+  // Post-processing pipelines
+  VkPipelineLayout m_blurPipelineLayout = VK_NULL_HANDLE;
+  VkPipeline m_blurPipeline = VK_NULL_HANDLE;
+  VkDescriptorSetLayout m_blurDescriptorSetLayout = VK_NULL_HANDLE;
+  VkDescriptorPool m_blurDescriptorPool = VK_NULL_HANDLE;
+  VkDescriptorSet m_blurDescriptorSet = VK_NULL_HANDLE; // Points to m_offscreenColorView
+  
+  VkPipelineLayout m_compositePipelineLayout = VK_NULL_HANDLE;
+  VkPipeline m_compositePipeline = VK_NULL_HANDLE;
+  VkDescriptorSetLayout m_compositeDescriptorSetLayout = VK_NULL_HANDLE;
+  VkDescriptorPool m_compositeDescriptorPool = VK_NULL_HANDLE;
+  VkDescriptorSet m_compositeDescriptorSet = VK_NULL_HANDLE; // Points to m_offscreenColorView and m_blurView
 
   struct ChunkRenderData {
     int x, y, z;
@@ -92,7 +129,16 @@ private:
   VkDeviceMemory m_globalIndexBufferMemory = VK_NULL_HANDLE;
   FreeListAllocator m_indexAllocator;
 
-  // Staging buffers for concurrent uploading
+  // Staging buffers for concurrent uploading (One per frame in flight)
+  static const int MAX_FRAMES_IN_FLIGHT = 3;
+  VkBuffer m_stagingBuffers[MAX_FRAMES_IN_FLIGHT] = {VK_NULL_HANDLE};
+  VkDeviceMemory m_stagingBufferMemories[MAX_FRAMES_IN_FLIGHT] = {VK_NULL_HANDLE};
+  void* m_stagingBuffersMapped[MAX_FRAMES_IN_FLIGHT] = {nullptr};
+  VkDeviceSize m_stagingBufferOffsets[MAX_FRAMES_IN_FLIGHT] = {0};
+
+  std::vector<mc::world::ChunkMesh> m_pendingMeshUploads;
+  std::mutex m_pendingUploadsMutex;
+
   VkCommandPool m_uploadCommandPool = VK_NULL_HANDLE;
 
   VkBuffer m_uniformBuffer = VK_NULL_HANDLE;
@@ -130,11 +176,20 @@ private:
   void CreateDescriptorPool();
   void CreateDescriptorSets();
 
+  void CreateOffscreenResources();
+  void CreatePostProcessPipelines();
+
   void RecordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex,
                            const mc::core::Camera &camera, float time,
-                           mc::core::EngineMetrics &metrics);
+                           mc::core::EngineMetrics &metrics, mc::world::ChunkManager &chunkManager);
+
 
   std::unique_ptr<DebugUI> m_debugUI;
+  std::unique_ptr<TextureManager> m_textureManager;
+  std::unique_ptr<SkyboxRenderer> m_skybox;
+  std::unique_ptr<VulkanRaytracer> m_vulkanRaytracer;
+  VkDescriptorSet m_raytraceDescriptorSet = VK_NULL_HANDLE;
 };
+
 
 } // namespace mc::render

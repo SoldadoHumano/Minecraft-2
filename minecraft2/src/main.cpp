@@ -1,18 +1,19 @@
 #include "core/camera.h"
 #include "core/job_system.h"
 #include "core/metrics.h"
+#include "core/profiler.h"
 #include "core/window.h"
 #include "logzilla/logzilla.h"
 #include "render/renderer.h"
 #include "world/chunk.h"
 #include "world/chunk_manager.h"
-#include <chrono>
-#include <fstream>
-#include <iostream>
-#include <volk.h>
-#include <imgui.h>
 #include <backends/imgui_impl_glfw.h>
 #include <backends/imgui_impl_vulkan.h>
+#include <chrono>
+#include <fstream>
+#include <imgui.h>
+#include <iostream>
+#include <volk.h>
 
 #ifdef _WIN32
 #pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:mainCRTStartup")
@@ -48,8 +49,9 @@ int main() {
 
   try {
     LOGZILLA_INFO("Creating Window...");
-    mc::core::Window window(1280, 720, "Minecraft Clone (Raw Vulkan)");
-    LOGZILLA_INFO("Window created OK, nativeWindow=%p", (void*)window.GetNativeWindow());
+    mc::core::Window window(1280, 720, "Minecraft Clone");
+    LOGZILLA_INFO("Window created OK, nativeWindow=%p",
+                  (void *)window.GetNativeWindow());
 
     LOGZILLA_INFO("Creating VulkanContext...");
     mc::render::VulkanContext vulkanContext(window.GetNativeWindow(),
@@ -61,8 +63,8 @@ int main() {
     LOGZILLA_INFO("Renderer created OK.");
 
     LOGZILLA_INFO("Creating Camera...");
-    mc::core::Camera camera(glm::vec3(8.0f, 70.0f, 8.0f), 45.0f,
-                            1280.0f / 720.0f, 0.1f, 3000.0f);
+    mc::core::Camera camera(glm::vec3(0.0f, 150.0f, 0.0f), 60.0f,
+                            1280.0f / 720.0f, 0.1f, 1000.0f);
     LOGZILLA_INFO("Camera created OK.");
     mc::core::EngineMetrics metrics;
 
@@ -85,6 +87,9 @@ int main() {
     float fpsTimer = 0.0f;
 
     while (!window.ShouldClose()) {
+      mc::core::Profiler::Get().BeginFrame();
+      PROFILE_SCOPE("Main Frame");
+
       window.PollEvents();
 
       auto currentTime = std::chrono::high_resolution_clock::now();
@@ -122,16 +127,23 @@ int main() {
 
       // F3 Toggle Logic
       static bool f3WasPressed = false;
+      static bool pWasPressed = false;
       bool f3IsPressed =
           (glfwGetKey(window.GetNativeWindow(), GLFW_KEY_F3) == GLFW_PRESS);
-      if (f3IsPressed && !f3WasPressed) {
+      bool pIsPressed =
+          (glfwGetKey(window.GetNativeWindow(), GLFW_KEY_P) == GLFW_PRESS);
+
+      if (f3IsPressed && pIsPressed && !pWasPressed) {
+        metrics.showProfiler = !metrics.showProfiler;
+      } else if (f3IsPressed && !f3WasPressed && !pIsPressed) {
         metrics.showF3 = !metrics.showF3;
       }
       f3WasPressed = f3IsPressed;
+      pWasPressed = pIsPressed;
 
       // Chunk Loading Updates
       static int previousViewDistance = metrics.viewDistance;
-      
+
       if (!metrics.isPaused) {
         if (metrics.viewDistance < previousViewDistance) {
           chunkManager.Clear();
@@ -216,13 +228,15 @@ int main() {
       }
 
       camera.Update(window.GetNativeWindow(), deltaTime);
-      if (!renderer.DrawFrame(camera, time, metrics)) {
+      if (!renderer.DrawFrame(camera, time, metrics, chunkManager)) {
         window.ResetWindowResizedFlag(); // force a recreate next frame
+
         int width, height;
         glfwGetFramebufferSize(window.GetNativeWindow(), &width, &height);
         renderer.RecreateSwapchain(width, height);
         camera.UpdateAspectRatio((float)width / (float)height);
       }
+      mc::core::Profiler::Get().EndFrame();
     }
 
     renderer.WaitIdle();

@@ -9,6 +9,7 @@ namespace mc::render {
 static const std::string vertShaderCode = R"(
 #version 450
 layout(location = 0) in uint inData;
+layout(location = 1) in uint inUVAndLayer;
 
 layout(binding = 0) uniform UniformBufferObject {
     mat4 model;
@@ -21,6 +22,7 @@ layout(push_constant) uniform PushConstants {
 } pushConstants;
 
 layout(location = 0) out vec3 fragColor;
+layout(location = 1) out vec3 fragUVAndLayer;
 
 vec3 getBlockColor(uint type) {
     if (type == 1) return vec3(0.5, 0.5, 0.5); // Stone
@@ -41,22 +43,32 @@ void main() {
     
     gl_Position = ubo.proj * ubo.view * ubo.model * vec4(worldPos, 1.0);
     
-    vec3 color = getBlockColor(type);
-    
+    vec3 color = vec3(1.0);
     if (face == 0 || face == 1) color *= 0.8;
     else if (face == 4 || face == 5) color *= 0.6;
     else if (face == 3) color *= 0.4;
     
     fragColor = color;
+
+    uint u = (inUVAndLayer >> 0) & 0xFF;
+    uint v = (inUVAndLayer >> 8) & 0xFF;
+    uint layer = (inUVAndLayer >> 16) & 0xFFFF;
+    fragUVAndLayer = vec3(float(u), float(v), float(layer));
 }
 )";
 
 static const std::string fragShaderCode = R"(
 #version 450
 layout(location = 0) in vec3 fragColor;
+layout(location = 1) in vec3 fragUVAndLayer;
+
+layout(binding = 1) uniform sampler2DArray texSampler;
+
 layout(location = 0) out vec4 outColor;
+
 void main() {
-    outColor = vec4(fragColor, 1.0);
+    vec4 texColor = texture(texSampler, fragUVAndLayer);
+    outColor = vec4(fragColor * texColor.rgb, texColor.a);
 }
 )";
 
@@ -87,7 +99,9 @@ void main() {
 }
 )";
 
-VkShaderModule VulkanPipeline::CreateShaderModule(VulkanContext& context, const std::vector<uint32_t> &code) {
+VkShaderModule
+VulkanPipeline::CreateShaderModule(VulkanContext &context,
+                                   const std::vector<uint32_t> &code) {
   VkShaderModuleCreateInfo createInfo{};
   createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
   createInfo.codeSize = code.size() * sizeof(uint32_t);
@@ -101,10 +115,9 @@ VkShaderModule VulkanPipeline::CreateShaderModule(VulkanContext& context, const 
   return shaderModule;
 }
 
-PipelineObjects VulkanPipeline::CreateGraphicsPipeline(VulkanContext& context, 
-                                                       VkRenderPass renderPass, 
-                                                       VkDescriptorSetLayout descriptorSetLayout,
-                                                       VkExtent2D extent) {
+PipelineObjects VulkanPipeline::CreateGraphicsPipeline(
+    VulkanContext &context, VkRenderPass renderPass,
+    VkDescriptorSetLayout descriptorSetLayout, VkExtent2D extent) {
   auto vertSpv = ShaderCompiler::CompileGLSLToSPIRV(vertShaderCode,
                                                     VK_SHADER_STAGE_VERTEX_BIT);
   auto fragSpv = ShaderCompiler::CompileGLSLToSPIRV(
@@ -135,11 +148,16 @@ PipelineObjects VulkanPipeline::CreateGraphicsPipeline(VulkanContext& context,
   bindingDescription.stride = sizeof(Vertex);
   bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
-  std::array<VkVertexInputAttributeDescription, 1> attributeDescriptions{};
+  std::array<VkVertexInputAttributeDescription, 2> attributeDescriptions{};
   attributeDescriptions[0].binding = 0;
   attributeDescriptions[0].location = 0;
   attributeDescriptions[0].format = VK_FORMAT_R32_UINT;
   attributeDescriptions[0].offset = offsetof(Vertex, data);
+
+  attributeDescriptions[1].binding = 0;
+  attributeDescriptions[1].location = 1;
+  attributeDescriptions[1].format = VK_FORMAT_R32_UINT;
+  attributeDescriptions[1].offset = offsetof(Vertex, uvAndLayer);
 
   VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
   vertexInputInfo.sType =
@@ -227,8 +245,8 @@ PipelineObjects VulkanPipeline::CreateGraphicsPipeline(VulkanContext& context,
 
   PipelineObjects objects{};
 
-  if (vkCreatePipelineLayout(context.GetDevice(), &pipelineLayoutInfo,
-                             nullptr, &objects.layout) != VK_SUCCESS) {
+  if (vkCreatePipelineLayout(context.GetDevice(), &pipelineLayoutInfo, nullptr,
+                             &objects.layout) != VK_SUCCESS) {
     throw std::runtime_error("failed to create pipeline layout!");
   }
 
@@ -268,9 +286,10 @@ PipelineObjects VulkanPipeline::CreateGraphicsPipeline(VulkanContext& context,
   return objects;
 }
 
-PipelineObjects VulkanPipeline::CreateAABBPipeline(VulkanContext& context,
-                                                   VkRenderPass renderPass,
-                                                   VkDescriptorSetLayout descriptorSetLayout) {
+PipelineObjects
+VulkanPipeline::CreateAABBPipeline(VulkanContext &context,
+                                   VkRenderPass renderPass,
+                                   VkDescriptorSetLayout descriptorSetLayout) {
   auto vertSpv = ShaderCompiler::CompileGLSLToSPIRV(aabbVertShaderCode,
                                                     VK_SHADER_STAGE_VERTEX_BIT);
   auto fragSpv = ShaderCompiler::CompileGLSLToSPIRV(
@@ -318,7 +337,7 @@ PipelineObjects VulkanPipeline::CreateAABBPipeline(VulkanContext& context,
   rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
   rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
   rasterizer.lineWidth = 1.0f;
-  rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+  rasterizer.cullMode = VK_CULL_MODE_NONE;
   rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 
   VkPipelineMultisampleStateCreateInfo multisampling{};
@@ -359,8 +378,8 @@ PipelineObjects VulkanPipeline::CreateAABBPipeline(VulkanContext& context,
   pipelineLayoutInfo.pushConstantRangeCount = 1;
   pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
 
-  if (vkCreatePipelineLayout(context.GetDevice(), &pipelineLayoutInfo,
-                             nullptr, &objects.layout) != VK_SUCCESS) {
+  if (vkCreatePipelineLayout(context.GetDevice(), &pipelineLayoutInfo, nullptr,
+                             &objects.layout) != VK_SUCCESS) {
     throw std::runtime_error("failed to create aabb pipeline layout!");
   }
 
@@ -395,6 +414,45 @@ PipelineObjects VulkanPipeline::CreateAABBPipeline(VulkanContext& context,
 
   vkDestroyShaderModule(context.GetDevice(), fragShaderModule, nullptr);
   vkDestroyShaderModule(context.GetDevice(), vertShaderModule, nullptr);
+
+  return objects;
+}
+
+PipelineObjects VulkanPipeline::CreateComputePipeline(VulkanContext& context,
+                                                      VkDescriptorSetLayout descriptorSetLayout,
+                                                      const std::vector<uint32_t>& computeCode) {
+  PipelineObjects objects{};
+
+  VkShaderModule compShaderModule = CreateShaderModule(context, computeCode);
+
+  VkPipelineShaderStageCreateInfo compShaderStageInfo{};
+  compShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  compShaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  compShaderStageInfo.module = compShaderModule;
+  compShaderStageInfo.pName = "main";
+
+  VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+  pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  pipelineLayoutInfo.setLayoutCount = 1;
+  pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
+
+  if (vkCreatePipelineLayout(context.GetDevice(), &pipelineLayoutInfo, nullptr,
+                             &objects.layout) != VK_SUCCESS) {
+    throw std::runtime_error("failed to create compute pipeline layout!");
+  }
+
+  VkComputePipelineCreateInfo pipelineInfo{};
+  pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+  pipelineInfo.layout = objects.layout;
+  pipelineInfo.stage = compShaderStageInfo;
+
+  if (vkCreateComputePipelines(context.GetDevice(), VK_NULL_HANDLE, 1,
+                               &pipelineInfo, nullptr,
+                               &objects.pipeline) != VK_SUCCESS) {
+    throw std::runtime_error("failed to create compute pipeline!");
+  }
+
+  vkDestroyShaderModule(context.GetDevice(), compShaderModule, nullptr);
 
   return objects;
 }

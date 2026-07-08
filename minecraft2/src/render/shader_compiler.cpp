@@ -17,6 +17,8 @@ ShaderCompiler::CompileGLSLToSPIRV(const std::string &glslSource,
   EShLanguage language = EShLangVertex;
   if (stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
     language = EShLangFragment;
+  } else if (stage == VK_SHADER_STAGE_COMPUTE_BIT) {
+    language = EShLangCompute;
   } else if (stage != VK_SHADER_STAGE_VERTEX_BIT) {
     throw std::runtime_error("Unsupported shader stage");
   }

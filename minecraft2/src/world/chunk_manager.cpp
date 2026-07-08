@@ -1,5 +1,6 @@
 #include "chunk_manager.h"
 #include "../core/job_system.h"
+#include "../core/profiler.h"
 #include <iostream>
 
 namespace mc::world {
@@ -20,6 +21,7 @@ void ChunkManager::Clear() {
 
 void ChunkManager::Update(int playerChunkX, int playerChunkZ,
                           int viewDistance) {
+  PROFILE_SCOPE("ChunkManager::Update");
   int loadDistance = viewDistance + 1; // +1 to prevent border flapping
 
   // Unload chunks outside load distance
@@ -41,31 +43,94 @@ void ChunkManager::Update(int playerChunkX, int playerChunkZ,
     }
   }
 
-  // Load chunks inside load distance
+  // Load chunks inside load distance (Radial Order)
+  std::vector<glm::ivec2> chunksToLoad;
   for (int x = -loadDistance; x <= loadDistance; ++x) {
     for (int z = -loadDistance; z <= loadDistance; ++z) {
-      int cx = playerChunkX + x;
-      int cz = playerChunkZ + z;
-      glm::ivec2 pos(cx, cz);
+      chunksToLoad.push_back(glm::ivec2(playerChunkX + x, playerChunkZ + z));
+    }
+  }
 
-      bool needsLoad = false;
-      {
-        std::lock_guard<std::mutex> lock(m_chunkMutex);
-        if (m_chunks.find(pos) == m_chunks.end()) {
-          m_chunks[pos] = {nullptr, ChunkState::LOADING};
-          needsLoad = true;
-        }
-      }
+  // Sort radially from player position
+  std::sort(chunksToLoad.begin(), chunksToLoad.end(),
+            [playerChunkX, playerChunkZ](const glm::ivec2 &a, const glm::ivec2 &b) {
+              int dxA = a.x - playerChunkX;
+              int dzA = a.y - playerChunkZ;
+              int distA = dxA * dxA + dzA * dzA;
+              
+              int dxB = b.x - playerChunkX;
+              int dzB = b.y - playerChunkZ;
+              int distB = dxB * dxB + dzB * dzB;
+              
+              return distA < distB;
+            });
 
-      if (needsLoad) {
-        RequestChunkLoad(cx, cz);
+  for (const auto &pos : chunksToLoad) {
+    bool needsLoad = false;
+    {
+      std::lock_guard<std::mutex> lock(m_chunkMutex);
+      if (m_chunks.find(pos) == m_chunks.end()) {
+        m_chunks[pos] = {nullptr, ChunkState::LOADING};
+        needsLoad = true;
       }
+    }
+
+    if (needsLoad) {
+      RequestChunkLoad(pos.x, pos.y);
     }
   }
 }
 
+void ChunkManager::GetVoxelGridData(int playerChunkX, int playerChunkZ, int radius, std::vector<uint8_t>& outBlocks, int& outSizeX, int& outSizeY, int& outSizeZ, int& outOffsetX, int& outOffsetZ) {
+    std::lock_guard<std::mutex> lock(m_chunkMutex);
+    
+    int numChunksX = radius * 2 + 1;
+    int numChunksZ = radius * 2 + 1;
+    
+    outSizeX = numChunksX * CHUNK_WIDTH;
+    outSizeY = CHUNK_HEIGHT;
+    outSizeZ = numChunksZ * CHUNK_DEPTH;
+    
+    outOffsetX = playerChunkX - radius;
+    outOffsetZ = playerChunkZ - radius;
+    
+    size_t totalBytes = outSizeX * outSizeY * outSizeZ;
+    if (outBlocks.size() != totalBytes) {
+        outBlocks.resize(totalBytes, 0);
+    } else {
+        std::fill(outBlocks.begin(), outBlocks.end(), 0); // Clear to air
+    }
+    
+    for (int cz = 0; cz < numChunksZ; ++cz) {
+        for (int cx = 0; cx < numChunksX; ++cx) {
+            int worldChunkX = outOffsetX + cx;
+            int worldChunkZ = outOffsetZ + cz;
+            
+            auto it = m_chunks.find(glm::ivec2(worldChunkX, worldChunkZ));
+            if (it != m_chunks.end() && it->second.chunk && it->second.state != ChunkState::LOADING) {
+                // Copy blocks
+                for (int y = 0; y < CHUNK_HEIGHT; ++y) {
+                    for (int z = 0; z < CHUNK_DEPTH; ++z) {
+                        for (int x = 0; x < CHUNK_WIDTH; ++x) {
+                            int localIndex = y + z * CHUNK_HEIGHT + x * CHUNK_HEIGHT * CHUNK_DEPTH; // From Chunk::GetIndex
+                            uint8_t blockId = static_cast<uint8_t>(it->second.chunk->GetBlock(x, y, z));
+                            
+                            int globalX = cx * CHUNK_WIDTH + x;
+                            int globalZ = cz * CHUNK_DEPTH + z;
+                            int globalIndex = globalX + outSizeX * (y + outSizeY * globalZ);
+                            
+                            outBlocks[globalIndex] = blockId;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 void ChunkManager::RequestChunkLoad(int cx, int cz) {
   mc::core::JobSystem::Execute([this, cx, cz]() {
+    PROFILE_SCOPE("Chunk Generation");
     auto chunk = std::make_shared<Chunk>(cx, cz);
     chunk->Generate(m_noise);
 
@@ -118,6 +183,7 @@ void ChunkManager::RequestChunkLoad(int cx, int cz) {
 
 void ChunkManager::RequestChunkMesh(int cx, int cz) {
   mc::core::JobSystem::Execute([this, cx, cz]() {
+    PROFILE_SCOPE("Chunk Meshing");
     std::shared_ptr<Chunk> chunk, nXP, nXM, nZP, nZM;
     {
       std::lock_guard<std::mutex> lock(m_chunkMutex);

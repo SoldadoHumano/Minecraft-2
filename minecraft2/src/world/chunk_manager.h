@@ -36,7 +36,11 @@ public:
     m_chunkUnloadCallback = callback;
   }
 
+  // Gets a flattened grid of voxel data centered around playerChunkX/Z
+  void GetVoxelGridData(int playerChunkX, int playerChunkZ, int radius, std::vector<uint8_t>& outBlocks, int& outSizeX, int& outSizeY, int& outSizeZ, int& outOffsetX, int& outOffsetZ);
+
 private:
+
   void RequestChunkLoad(int cx, int cz);
   void RequestChunkMesh(int cx, int cz);
 

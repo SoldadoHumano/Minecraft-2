@@ -103,40 +103,37 @@ float PerlinNoise::Fractal2D(float x, float y, int octaves, float persistence,
 // AVX2 SIMD Optimizations
 // ------------------------------------------------------------------------------------------------
 
-__m256 PerlinNoise::Fractal2D_AVX2(__m256 x, __m256 y, int octaves,
+void PerlinNoise::Fractal2D_AVX2(float* out_val, const float* x, const float* y, int octaves,
                                    float persistence, float lacunarity) const {
-  __m256 total = _mm256_setzero_ps();
-  __m256 frequency = _mm256_set1_ps(1.0f);
-  __m256 amplitude = _mm256_set1_ps(1.0f);
+  alignas(32) float total[8] = {0};
+  float frequency = 1.0f;
+  float amplitude = 1.0f;
   float maxValScalar = 0.0f;
-  float ampScalar = 1.0f;
-
-  __m256 vPersistence = _mm256_set1_ps(persistence);
-  __m256 vLacunarity = _mm256_set1_ps(lacunarity);
 
   for (int i = 0; i < octaves; ++i) {
-    __m256 nx = _mm256_mul_ps(x, frequency);
-    __m256 ny = _mm256_mul_ps(y, frequency);
-
     alignas(32) float x_arr[8];
     alignas(32) float y_arr[8];
-    alignas(32) float out_arr[8];
-    _mm256_store_ps(x_arr, nx);
-    _mm256_store_ps(y_arr, ny);
+    alignas(32) float noise_arr[8];
+    
+    for (int j = 0; j < 8; ++j) {
+        x_arr[j] = x[j] * frequency;
+        y_arr[j] = y[j] * frequency;
+    }
 
-    Noise2D_AVX2_ASM(out_arr, x_arr, y_arr, m_seed);
+    Noise2D_AVX2_ASM(noise_arr, x_arr, y_arr, m_seed);
 
-    __m256 noiseVal = _mm256_load_ps(out_arr);
-    total = _mm256_add_ps(total, _mm256_mul_ps(noiseVal, amplitude));
+    for (int j = 0; j < 8; ++j) {
+        total[j] += noise_arr[j] * amplitude;
+    }
 
-    maxValScalar += ampScalar;
-    ampScalar *= persistence;
-
-    amplitude = _mm256_mul_ps(amplitude, vPersistence);
-    frequency = _mm256_mul_ps(frequency, vLacunarity);
+    maxValScalar += amplitude;
+    amplitude *= persistence;
+    frequency *= lacunarity;
   }
 
-  return _mm256_div_ps(total, _mm256_set1_ps(maxValScalar));
+  for (int j = 0; j < 8; ++j) {
+      out_val[j] = total[j] / maxValScalar;
+  }
 }
 
 } // namespace mc::math

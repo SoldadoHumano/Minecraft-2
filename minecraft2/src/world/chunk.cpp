@@ -1,6 +1,7 @@
 #include "chunk.h"
 #include "../math/noise.h"
 #include "chunk_manager.h"
+#include "block_registry.h"
 #include <iostream>
 namespace mc::world {
 
@@ -41,8 +42,9 @@ Chunk::Chunk(int chunkX, int chunkZ) : m_chunkX(chunkX), m_chunkZ(chunkZ) {
   memset(m_blocks, 0, sizeof(m_blocks)); // BlockType::Air is 0
 }
 
-#include <immintrin.h>
-
+extern "C" void CalculateHeights_AVX2(const float* noise, int* heights);
+extern "C" void FillStone_AVX2(uint8_t* col, int stoneHeight, uint8_t stoneType);
+extern "C" void ChunkMesh_BuildVisibilityMask_AVX2(const uint8_t* sliceBlocks, const uint8_t* neighborBlocks, uint8_t* maskOut);
 void Chunk::Generate(const mc::math::PerlinNoise &noise) {
   alignas(32) float worldX_arr[CHUNK_WIDTH * CHUNK_DEPTH];
   alignas(32) float worldZ_arr[CHUNK_WIDTH * CHUNK_DEPTH];
@@ -57,22 +59,11 @@ void Chunk::Generate(const mc::math::PerlinNoise &noise) {
 
   int totalBlocks = CHUNK_WIDTH * CHUNK_DEPTH;
   for (int i = 0; i < totalBlocks; i += 8) {
-    __m256 vx = _mm256_loadu_ps(&worldX_arr[i]);
-    __m256 vz = _mm256_loadu_ps(&worldZ_arr[i]);
-    __m256 vNoise = noise.Fractal2D_AVX2(vx, vz, 4, 0.5f, 2.0f);
+    alignas(32) float noiseOut[8];
+    noise.Fractal2D_AVX2(noiseOut, &worldX_arr[i], &worldZ_arr[i], 4, 0.5f, 2.0f);
     
-    // height = 64 + (noiseVal * 32.0f)
-    __m256 vHeightF = _mm256_fmadd_ps(vNoise, _mm256_set1_ps(32.0f), _mm256_set1_ps(64.0f));
-    
-    // Bound heights between 1 and CHUNK_HEIGHT - 1 (255)
-    vHeightF = _mm256_max_ps(vHeightF, _mm256_set1_ps(1.0f));
-    vHeightF = _mm256_min_ps(vHeightF, _mm256_set1_ps(255.0f));
-    
-    // Convert to integers
-    __m256i vHeight = _mm256_cvttps_epi32(vHeightF);
-
     alignas(32) int heights[8];
-    _mm256_store_si256((__m256i*)heights, vHeight);
+    CalculateHeights_AVX2(noiseOut, heights);
 
     for (int j = 0; j < 8; ++j) {
       int x = (i + j) / CHUNK_DEPTH;
@@ -81,16 +72,10 @@ void Chunk::Generate(const mc::math::PerlinNoise &noise) {
 
       BlockType* col = &m_blocks[GetIndex(x, 0, z)];
       int stoneHeight = h > 3 ? h - 3 : 0;
-      int y = 0;
-
-      // Fill stone using 256-bit vectors (32 blocks per write)
-      __m256i vStone = _mm256_set1_epi8(static_cast<char>(BlockType::Stone));
-      for (; y + 31 < stoneHeight; y += 32) {
-        _mm256_storeu_si256((__m256i*)&col[y], vStone);
-      }
-      for (; y < stoneHeight; ++y) {
-        col[y] = BlockType::Stone;
-      }
+      
+      FillStone_AVX2((uint8_t*)col, stoneHeight, static_cast<uint8_t>(BlockType::Stone));
+      
+      int y = stoneHeight;
       for (; y < h - 1; ++y) {
         col[y] = BlockType::Dirt;
       }
@@ -158,37 +143,47 @@ void Chunk::AddGreedyQuad(std::vector<mc::render::Vertex> &vertices,
   uint32_t packedFace = (face & 0x7) << 18;
   uint32_t packedType = (static_cast<uint32_t>(type) & 0xFF) << 21;
 
+  const auto& texInfo = BlockRegistry::Get().GetTextureInfo(type);
+  uint32_t layer = 0;
+  if (face == 2) layer = texInfo.topLayer;
+  else if (face == 3) layer = texInfo.bottomLayer;
+  else layer = texInfo.sideLayer;
+
+  uint32_t packedLayer = layer & 0xFFFF;
+  
+  uint32_t uv[4][2];
+
   glm::vec3 p[4];
   if (face == 0) { // +X
-    p[0] = glm::vec3(x + 1, y, z + wz);
-    p[1] = glm::vec3(x + 1, y, z);
-    p[2] = glm::vec3(x + 1, y + wy, z);
-    p[3] = glm::vec3(x + 1, y + wy, z + wz);
+    p[0] = glm::vec3(x + 1, y, z + wz);     uv[0][0] = wz; uv[0][1] = 0;
+    p[1] = glm::vec3(x + 1, y, z);          uv[1][0] = 0; uv[1][1] = 0;
+    p[2] = glm::vec3(x + 1, y + wy, z);     uv[2][0] = 0; uv[2][1] = wy;
+    p[3] = glm::vec3(x + 1, y + wy, z + wz);uv[3][0] = wz; uv[3][1] = wy;
   } else if (face == 1) { // -X
-    p[0] = glm::vec3(x, y, z);
-    p[1] = glm::vec3(x, y, z + wz);
-    p[2] = glm::vec3(x, y + wy, z + wz);
-    p[3] = glm::vec3(x, y + wy, z);
+    p[0] = glm::vec3(x, y, z);              uv[0][0] = wz; uv[0][1] = 0;
+    p[1] = glm::vec3(x, y, z + wz);         uv[1][0] = 0; uv[1][1] = 0;
+    p[2] = glm::vec3(x, y + wy, z + wz);    uv[2][0] = 0; uv[2][1] = wy;
+    p[3] = glm::vec3(x, y + wy, z);         uv[3][0] = wz; uv[3][1] = wy;
   } else if (face == 2) { // +Y
-    p[0] = glm::vec3(x, y + 1, z + wz);
-    p[1] = glm::vec3(x + wx, y + 1, z + wz);
-    p[2] = glm::vec3(x + wx, y + 1, z);
-    p[3] = glm::vec3(x, y + 1, z);
+    p[0] = glm::vec3(x, y + 1, z + wz);     uv[0][0] = 0; uv[0][1] = wz;
+    p[1] = glm::vec3(x + wx, y + 1, z + wz);uv[1][0] = wx; uv[1][1] = wz;
+    p[2] = glm::vec3(x + wx, y + 1, z);     uv[2][0] = wx; uv[2][1] = 0;
+    p[3] = glm::vec3(x, y + 1, z);          uv[3][0] = 0; uv[3][1] = 0;
   } else if (face == 3) { // -Y
-    p[0] = glm::vec3(x, y, z);
-    p[1] = glm::vec3(x + wx, y, z);
-    p[2] = glm::vec3(x + wx, y, z + wz);
-    p[3] = glm::vec3(x, y, z + wz);
+    p[0] = glm::vec3(x, y, z);              uv[0][0] = 0; uv[0][1] = wz;
+    p[1] = glm::vec3(x + wx, y, z);         uv[1][0] = wx; uv[1][1] = wz;
+    p[2] = glm::vec3(x + wx, y, z + wz);    uv[2][0] = wx; uv[2][1] = 0;
+    p[3] = glm::vec3(x, y, z + wz);         uv[3][0] = 0; uv[3][1] = 0;
   } else if (face == 4) { // +Z
-    p[0] = glm::vec3(x, y, z + 1);
-    p[1] = glm::vec3(x + wx, y, z + 1);
-    p[2] = glm::vec3(x + wx, y + wy, z + 1);
-    p[3] = glm::vec3(x, y + wy, z + 1);
+    p[0] = glm::vec3(x, y, z + 1);          uv[0][0] = 0; uv[0][1] = 0;
+    p[1] = glm::vec3(x + wx, y, z + 1);     uv[1][0] = wx; uv[1][1] = 0;
+    p[2] = glm::vec3(x + wx, y + wy, z + 1);uv[2][0] = wx; uv[2][1] = wy;
+    p[3] = glm::vec3(x, y + wy, z + 1);     uv[3][0] = 0; uv[3][1] = wy;
   } else if (face == 5) { // -Z
-    p[0] = glm::vec3(x + wx, y, z);
-    p[1] = glm::vec3(x, y, z);
-    p[2] = glm::vec3(x, y + wy, z);
-    p[3] = glm::vec3(x + wx, y + wy, z);
+    p[0] = glm::vec3(x + wx, y, z);         uv[0][0] = 0; uv[0][1] = 0;
+    p[1] = glm::vec3(x, y, z);              uv[1][0] = wx; uv[1][1] = 0;
+    p[2] = glm::vec3(x, y + wy, z);         uv[2][0] = wx; uv[2][1] = wy;
+    p[3] = glm::vec3(x + wx, y + wy, z);    uv[3][0] = 0; uv[3][1] = wy;
   }
 
   for (int i = 0; i < 4; ++i) {
@@ -198,7 +193,12 @@ void Chunk::AddGreedyQuad(std::vector<mc::render::Vertex> &vertices,
 
     uint32_t cornerPackedXYZ = cx | (cy << 5) | (cz << 13);
     uint32_t finalData = cornerPackedXYZ | packedFace | packedType;
-    vertices.push_back({finalData});
+    
+    uint32_t u = uv[i][0] & 0xFF;
+    uint32_t v = uv[i][1] & 0xFF;
+    uint32_t uvAndLayer = (u) | (v << 8) | (packedLayer << 16);
+    
+    vertices.push_back({finalData, uvAndLayer});
   }
 
   indices.push_back(indexOffset + 0);
@@ -228,61 +228,54 @@ void Chunk::BuildMeshes(std::vector<struct ChunkMesh> &outMeshes) {
 
     auto buildGreedyFace = [&](int face) {
       for (int slice = 0; slice < 16; ++slice) {
+        alignas(32) uint8_t sliceBlocks[256];
+        alignas(32) uint8_t neighborBlocks[256];
+        alignas(32) uint8_t visibleMask[256];
+
         // Populate mask
         for (int u = 0; u < 16; ++u) {
           for (int v = 0; v < 16; ++v) {
             int x = 0, y = 0, z = 0;
             int nx = 0, ny = 0, nz = 0;
             if (face == 0) {
-              x = slice;
-              y = startY + u;
-              z = v;
-              nx = x + 1;
-              ny = y;
-              nz = z;
+              x = slice; y = startY + u; z = v;
+              nx = x + 1; ny = y; nz = z;
             } else if (face == 1) {
-              x = slice;
-              y = startY + u;
-              z = v;
-              nx = x - 1;
-              ny = y;
-              nz = z;
+              x = slice; y = startY + u; z = v;
+              nx = x - 1; ny = y; nz = z;
             } else if (face == 2) {
-              y = startY + slice;
-              x = u;
-              z = v;
-              nx = x;
-              ny = y + 1;
-              nz = z;
+              y = startY + slice; x = u; z = v;
+              nx = x; ny = y + 1; nz = z;
             } else if (face == 3) {
-              y = startY + slice;
-              x = u;
-              z = v;
-              nx = x;
-              ny = y - 1;
-              nz = z;
+              y = startY + slice; x = u; z = v;
+              nx = x; ny = y - 1; nz = z;
             } else if (face == 4) {
-              z = slice;
-              x = u;
-              y = startY + v;
-              nx = x;
-              ny = y;
-              nz = z + 1;
+              z = slice; x = u; y = startY + v;
+              nx = x; ny = y; nz = z + 1;
             } else if (face == 5) {
-              z = slice;
-              x = u;
-              y = startY + v;
-              nx = x;
-              ny = y;
-              nz = z - 1;
+              z = slice; x = u; y = startY + v;
+              nx = x; ny = y; nz = z - 1;
             }
 
-            BlockType type = GetBlock(x, y, z);
-            if (type != BlockType::Air && IsFaceVisible(nx, ny, nz)) {
-              mask[u][v] = {true, type};
-            } else {
-              mask[u][v] = {false, BlockType::Air};
+            sliceBlocks[u * 16 + v] = static_cast<uint8_t>(GetBlock(x, y, z));
+            
+            BlockType nType = BlockType::Air;
+            if (ny >= 0 && ny < CHUNK_HEIGHT) {
+              if (nx < 0) nType = m_neighborXM ? m_neighborXM->GetBlock(CHUNK_WIDTH - 1, ny, nz) : BlockType::Air;
+              else if (nx >= CHUNK_WIDTH) nType = m_neighborXP ? m_neighborXP->GetBlock(0, ny, nz) : BlockType::Air;
+              else if (nz < 0) nType = m_neighborZM ? m_neighborZM->GetBlock(nx, ny, CHUNK_DEPTH - 1) : BlockType::Air;
+              else if (nz >= CHUNK_DEPTH) nType = m_neighborZP ? m_neighborZP->GetBlock(nx, ny, 0) : BlockType::Air;
+              else nType = GetBlock(nx, ny, nz);
             }
+            neighborBlocks[u * 16 + v] = static_cast<uint8_t>(nType);
+          }
+        }
+        
+        ChunkMesh_BuildVisibilityMask_AVX2(sliceBlocks, neighborBlocks, visibleMask);
+        
+        for (int u = 0; u < 16; ++u) {
+          for (int v = 0; v < 16; ++v) {
+            mask[u][v] = { visibleMask[u * 16 + v] != 0, static_cast<BlockType>(sliceBlocks[u * 16 + v]) };
           }
         }
 

@@ -20,6 +20,8 @@ else()
     add_compile_options(-Wall -Wextra -pthread)
 endif()
 
+
+
 # Output directories
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
@@ -100,8 +102,8 @@ target_link_libraries(volk PUBLIC Vulkan::Headers)
 # Application Target
 # ------------------------------------------------------------------------------
 
-file(GLOB_RECURSE SRC_FILES "src/*.cpp" "src/*.c" "src/*.asm")
-file(GLOB_RECURSE HEADER_FILES "src/*.h" "src/*.hpp")
+file(GLOB_RECURSE SRC_FILES "src/*.cpp" "src/*.c" "src/*.asm" "src/*.cu")
+file(GLOB_RECURSE HEADER_FILES "src/*.h" "src/*.hpp" "src/*.cuh")
 
 add_executable(${PROJECT_NAME} ${SRC_FILES} ${HEADER_FILES})
 
@@ -136,3 +138,10 @@ if(NOT MSVC)
 endif()
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE IMGUI_IMPL_VULKAN_USE_VOLK)
+
+# Copy textures to output directory
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/textures
+    $<TARGET_FILE_DIR:${PROJECT_NAME}>/textures
+)

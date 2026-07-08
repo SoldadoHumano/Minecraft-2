@@ -24,6 +24,10 @@ public:
                                             VkRenderPass renderPass,
                                             VkDescriptorSetLayout descriptorSetLayout);
 
+  static PipelineObjects CreateComputePipeline(VulkanContext& context,
+                                               VkDescriptorSetLayout descriptorSetLayout,
+                                               const std::vector<uint32_t>& computeCode);
+
 private:
   static VkShaderModule CreateShaderModule(VulkanContext& context, const std::vector<uint32_t> &code);
 };

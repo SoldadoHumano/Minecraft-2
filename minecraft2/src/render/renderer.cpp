@@ -1,15 +1,18 @@
 #include "renderer.h"
+#include "../core/profiler.h"
 #include "../logzilla/logzilla.h"
+#include "../world/block_registry.h"
 #include "shader_compiler.h"
 #include <algorithm>
 #include <array>
-#include <cstring>
-#include <glm/gtc/matrix_transform.hpp>
-#include <iostream>
-#include <stdexcept>
-#include <imgui.h>
 #include <backends/imgui_impl_glfw.h>
 #include <backends/imgui_impl_vulkan.h>
+#include <cstring>
+#include <glm/gtc/matrix_transform.hpp>
+#include <imgui.h>
+#include <iostream>
+#include <stdexcept>
+
 
 namespace mc::render {
 
@@ -21,18 +24,28 @@ Renderer::Renderer(VulkanContext &context, uint32_t width, uint32_t height)
   LOGZILLA_INFO("Initializing Swapchain...");
   m_swapchain = std::make_unique<VulkanSwapchain>(m_context, m_width, m_height);
 
+  LOGZILLA_INFO("Initializing TextureManager...");
+  m_textureManager = std::make_unique<TextureManager>(m_context);
+  // Force BlockRegistry to initialize its default blocks
+  auto &registry = mc::world::BlockRegistry::Get();
+  m_textureManager->LoadTextures(registry.GetAllTextures(), "textures/blocks");
+  registry.UpdateTextureLayers(m_textureManager->GetLayerMap());
+
   LOGZILLA_INFO("CreateDescriptorSetLayout...");
   CreateDescriptorSetLayout();
 
   LOGZILLA_INFO("CreateGraphicsPipeline...");
-  PipelineObjects graphicsPipeline = VulkanPipeline::CreateGraphicsPipeline(m_context, m_swapchain->GetRenderPass(), m_descriptorSetLayout, m_swapchain->GetExtent());
+  PipelineObjects graphicsPipeline = VulkanPipeline::CreateGraphicsPipeline(
+      m_context, m_swapchain->GetRenderPass(), m_descriptorSetLayout,
+      m_swapchain->GetExtent());
   m_pipelineLayout = graphicsPipeline.layout;
   m_graphicsPipeline = graphicsPipeline.pipeline;
 
   LOGZILLA_INFO("CreateQueryPool...");
   CreateQueryPool();
   LOGZILLA_INFO("CreateAABBPipeline...");
-  PipelineObjects aabbPipeline = VulkanPipeline::CreateAABBPipeline(m_context, m_swapchain->GetRenderPass(), m_descriptorSetLayout);
+  PipelineObjects aabbPipeline = VulkanPipeline::CreateAABBPipeline(
+      m_context, m_swapchain->GetRenderPass(), m_descriptorSetLayout);
   m_aabbPipelineLayout = aabbPipeline.layout;
   m_aabbPipeline = aabbPipeline.pipeline;
 
@@ -46,6 +59,20 @@ Renderer::Renderer(VulkanContext &context, uint32_t width, uint32_t height)
   CreateDescriptorPool();
   LOGZILLA_INFO("CreateDescriptorSets...");
   CreateDescriptorSets();
+  
+  LOGZILLA_INFO("Skybox init...");
+  
+  LOGZILLA_INFO("Creating offscreen resources...");
+  CreateOffscreenResources();
+
+  LOGZILLA_INFO("Init Vulkan Raytracer...");
+  m_vulkanRaytracer = std::make_unique<VulkanRaytracer>(m_context, m_commandPool);
+  m_vulkanRaytracer->Init(m_width, m_height, m_textureManager->GetTextureArrayView(), m_textureManager->GetTextureSampler());
+
+  CreatePostProcessPipelines();
+  
+  m_skybox = std::make_unique<SkyboxRenderer>(m_context, m_mainRenderPass);
+
   LOGZILLA_INFO("DebugUI init...");
   m_debugUI = std::make_unique<DebugUI>();
   LOGZILLA_INFO("DebugUI created OK.");
@@ -56,43 +83,49 @@ Renderer::Renderer(VulkanContext &context, uint32_t width, uint32_t height)
   LOGZILLA_INFO("ImGui: CreateContext...");
   ImGui::CreateContext();
   LOGZILLA_INFO("ImGui: GetIO...");
-  ImGuiIO& io = ImGui::GetIO(); (void)io;
+  ImGuiIO &io = ImGui::GetIO();
+  (void)io;
   LOGZILLA_INFO("ImGui: StyleColorsDark...");
   ImGui::StyleColorsDark();
   LOGZILLA_INFO("ImGui: Context ready.");
 
   // Create ImGui Descriptor Pool
   LOGZILLA_INFO("ImGui: Creating descriptor pool...");
-  VkDescriptorPoolSize pool_sizes[] =
-  {
-      { VK_DESCRIPTOR_TYPE_SAMPLER, 1000 },
-      { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000 },
-      { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1000 },
-      { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1000 },
-      { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1000 },
-      { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1000 },
-      { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1000 },
-      { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1000 },
-      { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1000 },
-      { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1000 },
-      { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1000 }
-  };
+  VkDescriptorPoolSize pool_sizes[] = {
+      {VK_DESCRIPTOR_TYPE_SAMPLER, 1000},
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000},
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1000},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1000},
+      {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1000},
+      {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1000},
+      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1000},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1000},
+      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1000},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1000},
+      {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1000}};
   VkDescriptorPoolCreateInfo pool_info = {};
   pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
   pool_info.maxSets = 1000 * IM_ARRAYSIZE(pool_sizes);
   pool_info.poolSizeCount = (uint32_t)IM_ARRAYSIZE(pool_sizes);
   pool_info.pPoolSizes = pool_sizes;
-  VkResult poolResult = vkCreateDescriptorPool(m_context.GetDevice(), &pool_info, nullptr, &m_imguiDescriptorPool);
-  LOGZILLA_INFO("ImGui: Descriptor pool created, result=%d, pool=%p", (int)poolResult, (void*)m_imguiDescriptorPool);
+  VkResult poolResult = vkCreateDescriptorPool(
+      m_context.GetDevice(), &pool_info, nullptr, &m_imguiDescriptorPool);
+  LOGZILLA_INFO("ImGui: Descriptor pool created, result=%d, pool=%p",
+                (int)poolResult, (void *)m_imguiDescriptorPool);
 
-  LOGZILLA_INFO("ImGui: LoadFunctions (instance=%p)...", (void*)m_context.GetInstance());
-  ImGui_ImplVulkan_LoadFunctions([](const char* function_name, void* vulkan_instance) {
-    return vkGetInstanceProcAddr(reinterpret_cast<VkInstance>(vulkan_instance), function_name);
-  }, reinterpret_cast<void*>(m_context.GetInstance()));
+  LOGZILLA_INFO("ImGui: LoadFunctions (instance=%p)...",
+                (void *)m_context.GetInstance());
+  ImGui_ImplVulkan_LoadFunctions(
+      [](const char *function_name, void *vulkan_instance) {
+        return vkGetInstanceProcAddr(
+            reinterpret_cast<VkInstance>(vulkan_instance), function_name);
+      },
+      reinterpret_cast<void *>(m_context.GetInstance()));
   LOGZILLA_INFO("ImGui: LoadFunctions done.");
 
-  LOGZILLA_INFO("ImGui: ImGui_ImplGlfw_InitForVulkan (window=%p)...", (void*)m_context.GetWindow());
+  LOGZILLA_INFO("ImGui: ImGui_ImplGlfw_InitForVulkan (window=%p)...",
+                (void *)m_context.GetWindow());
   ImGui_ImplGlfw_InitForVulkan(m_context.GetWindow(), true);
   LOGZILLA_INFO("ImGui: ImGui_ImplGlfw_InitForVulkan done.");
 
@@ -100,7 +133,9 @@ Renderer::Renderer(VulkanContext &context, uint32_t width, uint32_t height)
   init_info.Instance = m_context.GetInstance();
   init_info.PhysicalDevice = m_context.GetPhysicalDevice();
   init_info.Device = m_context.GetDevice();
-  init_info.QueueFamily = m_context.FindQueueFamilies(m_context.GetPhysicalDevice()).graphicsFamily.value();
+  init_info.QueueFamily =
+      m_context.FindQueueFamilies(m_context.GetPhysicalDevice())
+          .graphicsFamily.value();
   init_info.Queue = m_context.GetGraphicsQueue();
   init_info.PipelineCache = VK_NULL_HANDLE;
   init_info.DescriptorPool = m_imguiDescriptorPool;
@@ -111,13 +146,22 @@ Renderer::Renderer(VulkanContext &context, uint32_t width, uint32_t height)
   init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
   init_info.Allocator = nullptr;
   init_info.CheckVkResultFn = nullptr;
-  LOGZILLA_INFO("ImGui: ImGui_ImplVulkan_Init (Instance=%p, PhysDevice=%p, Device=%p, QueueFamily=%d, Queue=%p, RenderPass=%p, MinImg=%d, ImgCount=%d)...",
-                (void*)init_info.Instance, (void*)init_info.PhysicalDevice,
-                (void*)init_info.Device, init_info.QueueFamily,
-                (void*)init_info.Queue, (void*)init_info.RenderPass,
-                init_info.MinImageCount, init_info.ImageCount);
+  LOGZILLA_INFO(
+      "ImGui: ImGui_ImplVulkan_Init (Instance=%p, PhysDevice=%p, Device=%p, "
+      "QueueFamily=%d, Queue=%p, RenderPass=%p, MinImg=%d, ImgCount=%d)...",
+      (void *)init_info.Instance, (void *)init_info.PhysicalDevice,
+      (void *)init_info.Device, init_info.QueueFamily, (void *)init_info.Queue,
+      (void *)init_info.RenderPass, init_info.MinImageCount,
+      init_info.ImageCount);
   ImGui_ImplVulkan_Init(&init_info);
   LOGZILLA_INFO("ImGui: ImGui_ImplVulkan_Init done.");
+
+  LOGZILLA_INFO("ImGui: Registering raytrace descriptor set...");
+  m_raytraceDescriptorSet = ImGui_ImplVulkan_AddTexture(
+      m_vulkanRaytracer->GetOutputSampler(),
+      m_vulkanRaytracer->GetOutputImageView(),
+      VK_IMAGE_LAYOUT_GENERAL
+  );
 
   // Upload ImGui fonts
   LOGZILLA_INFO("ImGui: Creating temp command pool for font upload...");
@@ -125,9 +169,11 @@ Renderer::Renderer(VulkanContext &context, uint32_t width, uint32_t height)
   VkCommandPoolCreateInfo tempPoolInfo{};
   tempPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
   tempPoolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-  tempPoolInfo.queueFamilyIndex = m_context.FindQueueFamilies(m_context.GetPhysicalDevice()).graphicsFamily.value();
+  tempPoolInfo.queueFamilyIndex =
+      m_context.FindQueueFamilies(m_context.GetPhysicalDevice())
+          .graphicsFamily.value();
   vkCreateCommandPool(m_context.GetDevice(), &tempPoolInfo, nullptr, &tempPool);
-  LOGZILLA_INFO("ImGui: Temp command pool created, pool=%p", (void*)tempPool);
+  LOGZILLA_INFO("ImGui: Temp command pool created, pool=%p", (void *)tempPool);
 
   VkCommandBufferAllocateInfo allocInfo{};
   allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -137,18 +183,18 @@ Renderer::Renderer(VulkanContext &context, uint32_t width, uint32_t height)
 
   VkCommandBuffer cmd;
   vkAllocateCommandBuffers(m_context.GetDevice(), &allocInfo, &cmd);
-  LOGZILLA_INFO("ImGui: Command buffer allocated, cmd=%p", (void*)cmd);
+  LOGZILLA_INFO("ImGui: Command buffer allocated, cmd=%p", (void *)cmd);
 
   VkCommandBufferBeginInfo beginInfo{};
   beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   vkBeginCommandBuffer(cmd, &beginInfo);
   LOGZILLA_INFO("ImGui: Command buffer recording started.");
-  
+
   LOGZILLA_INFO("ImGui: CreateFontsTexture...");
   ImGui_ImplVulkan_CreateFontsTexture();
   LOGZILLA_INFO("ImGui: CreateFontsTexture done.");
-  
+
   vkEndCommandBuffer(cmd);
   LOGZILLA_INFO("ImGui: Command buffer recording ended.");
 
@@ -161,7 +207,7 @@ Renderer::Renderer(VulkanContext &context, uint32_t width, uint32_t height)
   LOGZILLA_INFO("ImGui: vkQueueWaitIdle...");
   vkQueueWaitIdle(m_context.GetGraphicsQueue());
   LOGZILLA_INFO("ImGui: Font upload complete.");
-  
+
   vkFreeCommandBuffers(m_context.GetDevice(), tempPool, 1, &cmd);
   vkDestroyCommandPool(m_context.GetDevice(), tempPool, nullptr);
   ImGui_ImplVulkan_DestroyFontsTexture();
@@ -173,6 +219,7 @@ Renderer::Renderer(VulkanContext &context, uint32_t width, uint32_t height)
   CreateSyncObjects();
   LOGZILLA_INFO("CreateGlobalBuffers...");
   CreateGlobalBuffers();
+
   LOGZILLA_INFO("Renderer init done!");
 }
 
@@ -188,27 +235,59 @@ Renderer::~Renderer() {
     vkDestroyDescriptorPool(device, m_imguiDescriptorPool, nullptr);
   }
 
+  m_skybox.reset();
   m_debugUI.reset();
 
   // AABB Occlusion Culling
 
   vkDestroySemaphore(device, m_renderFinishedSemaphore, nullptr);
   vkDestroySemaphore(device, m_imageAvailableSemaphore, nullptr);
+  
+  // Clean up post-processing resources
+  vkDestroyPipeline(device, m_blurPipeline, nullptr);
+  vkDestroyPipelineLayout(device, m_blurPipelineLayout, nullptr);
+  vkDestroyDescriptorSetLayout(device, m_blurDescriptorSetLayout, nullptr);
+  vkDestroyDescriptorPool(device, m_blurDescriptorPool, nullptr);
+  
+  vkDestroyPipeline(device, m_compositePipeline, nullptr);
+  vkDestroyPipelineLayout(device, m_compositePipelineLayout, nullptr);
+  vkDestroyDescriptorSetLayout(device, m_compositeDescriptorSetLayout, nullptr);
+  
+  vkDestroyFramebuffer(device, m_mainFramebuffer, nullptr);
+  vkDestroyRenderPass(device, m_mainRenderPass, nullptr);
+  vkDestroyImageView(device, m_offscreenColorView, nullptr);
+  vkDestroyImage(device, m_offscreenColorImage, nullptr);
+  vkFreeMemory(device, m_offscreenColorMemory, nullptr);
+  
+  vkDestroyImageView(device, m_offscreenDepthView, nullptr);
+  vkDestroyImage(device, m_offscreenDepthImage, nullptr);
+  vkFreeMemory(device, m_offscreenDepthMemory, nullptr);
+  
+  vkDestroyFramebuffer(device, m_blurFramebuffer, nullptr);
+  vkDestroyRenderPass(device, m_blurRenderPass, nullptr);
+  vkDestroyImageView(device, m_blurView, nullptr);
+  vkDestroyImage(device, m_blurImage, nullptr);
+  vkFreeMemory(device, m_blurMemory, nullptr);
+
   vkDestroyFence(device, m_inFlightFence, nullptr);
 
   vkDestroyCommandPool(device, m_commandPool, nullptr);
 
   for (auto &pair : m_chunkRenderData) {
-    if (pair.second.indexAllocation.valid) m_indexAllocator.Free(pair.second.indexAllocation);
-    if (pair.second.vertexAllocation.valid) m_vertexAllocator.Free(pair.second.vertexAllocation);
+    if (pair.second.indexAllocation.valid)
+      m_indexAllocator.Free(pair.second.indexAllocation);
+    if (pair.second.vertexAllocation.valid)
+      m_vertexAllocator.Free(pair.second.vertexAllocation);
   }
-  
+
   for (auto &garbage : m_garbageQueue) {
-    if (garbage.vertexAlloc.valid) m_vertexAllocator.Free(garbage.vertexAlloc);
-    if (garbage.indexAlloc.valid) m_indexAllocator.Free(garbage.indexAlloc);
+    if (garbage.vertexAlloc.valid)
+      m_vertexAllocator.Free(garbage.vertexAlloc);
+    if (garbage.indexAlloc.valid)
+      m_indexAllocator.Free(garbage.indexAlloc);
   }
   m_garbageQueue.clear();
-  
+
   m_chunkRenderData.clear();
   vkDestroyQueryPool(device, m_queryPool, nullptr);
 
@@ -248,10 +327,21 @@ void Renderer::CreateDescriptorSetLayout() {
   uboLayoutBinding.pImmutableSamplers = nullptr;
   uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
+  VkDescriptorSetLayoutBinding samplerLayoutBinding{};
+  samplerLayoutBinding.binding = 1;
+  samplerLayoutBinding.descriptorCount = 1;
+  samplerLayoutBinding.descriptorType =
+      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  samplerLayoutBinding.pImmutableSamplers = nullptr;
+  samplerLayoutBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+  std::array<VkDescriptorSetLayoutBinding, 2> bindings = {uboLayoutBinding,
+                                                          samplerLayoutBinding};
+
   VkDescriptorSetLayoutCreateInfo layoutInfo{};
   layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  layoutInfo.bindingCount = 1;
-  layoutInfo.pBindings = &uboLayoutBinding;
+  layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+  layoutInfo.pBindings = bindings.data();
 
   if (vkCreateDescriptorSetLayout(m_context.GetDevice(), &layoutInfo, nullptr,
                                   &m_descriptorSetLayout) != VK_SUCCESS) {
@@ -306,10 +396,11 @@ void Renderer::CreateAABBBuffer() {
   VkDeviceSize vertexSize = sizeof(vertices[0]) * vertices.size();
   VkBuffer stagingBuffer;
   VkDeviceMemory stagingBufferMemory;
-  VulkanBuffer::CreateBuffer(m_context, vertexSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-               stagingBuffer, stagingBufferMemory);
+  VulkanBuffer::CreateBuffer(m_context, vertexSize,
+                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                             stagingBuffer, stagingBufferMemory);
 
   void *data;
   vkMapMemory(m_context.GetDevice(), stagingBufferMemory, 0, vertexSize, 0,
@@ -318,19 +409,21 @@ void Renderer::CreateAABBBuffer() {
   vkUnmapMemory(m_context.GetDevice(), stagingBufferMemory);
 
   VulkanBuffer::CreateBuffer(m_context, vertexSize,
-               VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_aabbVertexBuffer,
-               m_aabbVertexBufferMemory);
-  VulkanBuffer::CopyBuffer(m_context, stagingBuffer,  m_aabbVertexBuffer,  vertexSize, 0, 0, m_graphicsQueueMutex);
+                             VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                             m_aabbVertexBuffer, m_aabbVertexBufferMemory);
+  VulkanBuffer::CopyBuffer(m_context, stagingBuffer, m_aabbVertexBuffer,
+                           vertexSize, 0, 0, m_graphicsQueueMutex);
   vkDestroyBuffer(m_context.GetDevice(), stagingBuffer, nullptr);
   vkFreeMemory(m_context.GetDevice(), stagingBufferMemory, nullptr);
 
   VkDeviceSize indexSize = sizeof(indices[0]) * indices.size();
-  VulkanBuffer::CreateBuffer(m_context, indexSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-               stagingBuffer, stagingBufferMemory);
+  VulkanBuffer::CreateBuffer(m_context, indexSize,
+                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                             stagingBuffer, stagingBufferMemory);
 
   vkMapMemory(m_context.GetDevice(), stagingBufferMemory, 0, indexSize, 0,
               &data);
@@ -338,33 +431,37 @@ void Renderer::CreateAABBBuffer() {
   vkUnmapMemory(m_context.GetDevice(), stagingBufferMemory);
 
   VulkanBuffer::CreateBuffer(m_context, indexSize,
-               VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                   VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_aabbIndexBuffer,
-               m_aabbIndexBufferMemory);
-  VulkanBuffer::CopyBuffer(m_context, stagingBuffer,  m_aabbIndexBuffer,  indexSize, 0, 0, m_graphicsQueueMutex);
+                             VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                             m_aabbIndexBuffer, m_aabbIndexBufferMemory);
+  VulkanBuffer::CopyBuffer(m_context, stagingBuffer, m_aabbIndexBuffer,
+                           indexSize, 0, 0, m_graphicsQueueMutex);
   vkDestroyBuffer(m_context.GetDevice(), stagingBuffer, nullptr);
   vkFreeMemory(m_context.GetDevice(), stagingBufferMemory, nullptr);
 }
 void Renderer::CreateUniformBuffers() {
   VkDeviceSize bufferSize = sizeof(UniformBufferObject);
-  VulkanBuffer::CreateBuffer(m_context, bufferSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-               m_uniformBuffer, m_uniformBufferMemory);
+  VulkanBuffer::CreateBuffer(m_context, bufferSize,
+                             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                             m_uniformBuffer, m_uniformBufferMemory);
   vkMapMemory(m_context.GetDevice(), m_uniformBufferMemory, 0, bufferSize, 0,
               &m_uniformBufferMapped);
 }
 
 void Renderer::CreateDescriptorPool() {
-  VkDescriptorPoolSize poolSize{};
-  poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-  poolSize.descriptorCount = 1;
+  std::array<VkDescriptorPoolSize, 2> poolSizes{};
+  poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  poolSizes[0].descriptorCount = 1;
+  poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  poolSizes[1].descriptorCount = 1;
 
   VkDescriptorPoolCreateInfo poolInfo{};
   poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  poolInfo.poolSizeCount = 1;
-  poolInfo.pPoolSizes = &poolSize;
+  poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+  poolInfo.pPoolSizes = poolSizes.data();
   poolInfo.maxSets = 1;
 
   if (vkCreateDescriptorPool(m_context.GetDevice(), &poolInfo, nullptr,
@@ -390,40 +487,70 @@ void Renderer::CreateDescriptorSets() {
   bufferInfo.offset = 0;
   bufferInfo.range = sizeof(UniformBufferObject);
 
-  VkWriteDescriptorSet descriptorWrite{};
-  descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-  descriptorWrite.dstSet = m_descriptorSet;
-  descriptorWrite.dstBinding = 0;
-  descriptorWrite.dstArrayElement = 0;
-  descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-  descriptorWrite.descriptorCount = 1;
-  descriptorWrite.pBufferInfo = &bufferInfo;
+  VkDescriptorImageInfo imageInfo{};
+  imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  imageInfo.imageView = m_textureManager->GetTextureArrayView();
+  imageInfo.sampler = m_textureManager->GetTextureSampler();
 
-  vkUpdateDescriptorSets(m_context.GetDevice(), 1, &descriptorWrite, 0,
-                         nullptr);
+  std::array<VkWriteDescriptorSet, 2> descriptorWrites{};
+
+  descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  descriptorWrites[0].dstSet = m_descriptorSet;
+  descriptorWrites[0].dstBinding = 0;
+  descriptorWrites[0].dstArrayElement = 0;
+  descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  descriptorWrites[0].descriptorCount = 1;
+  descriptorWrites[0].pBufferInfo = &bufferInfo;
+
+  descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  descriptorWrites[1].dstSet = m_descriptorSet;
+  descriptorWrites[1].dstBinding = 1;
+  descriptorWrites[1].dstArrayElement = 0;
+  descriptorWrites[1].descriptorType =
+      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  descriptorWrites[1].descriptorCount = 1;
+  descriptorWrites[1].pImageInfo = &imageInfo;
+
+  vkUpdateDescriptorSets(m_context.GetDevice(),
+                         static_cast<uint32_t>(descriptorWrites.size()),
+                         descriptorWrites.data(), 0, nullptr);
 }
 
 void Renderer::CreateGlobalBuffers() {
-  // 128 MB for vertices (approx 3 million vertices), 64 MB for indices (approx 16 million indices)
+  // 128 MB for vertices (approx 3 million vertices), 64 MB for indices (approx
+  // 16 million indices)
   const VkDeviceSize vertexBufferSize = 128 * 1024 * 1024;
   const VkDeviceSize indexBufferSize = 64 * 1024 * 1024;
 
   VulkanBuffer::CreateBuffer(m_context, vertexBufferSize,
-               VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_globalVertexBuffer,
-               m_globalVertexBufferMemory);
+                             VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                             m_globalVertexBuffer, m_globalVertexBufferMemory);
 
   VulkanBuffer::CreateBuffer(m_context, indexBufferSize,
-               VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_globalIndexBuffer,
-               m_globalIndexBufferMemory);
+                             VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                             m_globalIndexBuffer, m_globalIndexBufferMemory);
 
   // Initialize allocators with maximum capacities (in vertices / indices)
   uint32_t maxVertices = vertexBufferSize / sizeof(mc::render::Vertex);
   uint32_t maxIndices = indexBufferSize / sizeof(uint32_t);
-  
+
   m_vertexAllocator.Initialize(maxVertices);
   m_indexAllocator.Initialize(maxIndices);
+
+  const VkDeviceSize stagingBufferSize = 8 * 1024 * 1024; // 8 MB per frame
+  for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+    VulkanBuffer::CreateBuffer(m_context, stagingBufferSize,
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                               m_stagingBuffers[i], m_stagingBufferMemories[i]);
+    vkMapMemory(m_context.GetDevice(), m_stagingBufferMemories[i], 0,
+                stagingBufferSize, 0, &m_stagingBuffersMapped[i]);
+  }
 }
 
 void Renderer::CreateCommandBuffers() {
@@ -463,7 +590,9 @@ void Renderer::CreateSyncObjects() {
 void Renderer::RecordCommandBuffer(VkCommandBuffer commandBuffer,
                                    uint32_t imageIndex,
                                    const mc::core::Camera &camera, float time,
-                                   mc::core::EngineMetrics &metrics) {
+                                   mc::core::EngineMetrics &metrics, mc::world::ChunkManager &chunkManager) {
+
+  PROFILE_SCOPE("Renderer::RecordCommandBuffer");
   static int record_count = 0;
   if (record_count < 3) {
     LOGZILLA_INFO("RecordCommandBuffer %d", record_count);
@@ -477,10 +606,34 @@ void Renderer::RecordCommandBuffer(VkCommandBuffer commandBuffer,
     throw std::runtime_error("failed to begin recording command buffer!");
   }
 
+  // Process any chunk meshes that finished generating in the background
+  ProcessPendingChunks(commandBuffer, imageIndex);
+
+  // Bypass rasterizer entirely if raytracing is enabled
+  if (metrics.enableRaytracing) {
+      PROFILE_SCOPE("Vulkan Raytracing");
+      int radius = 12; // Use full render distance!
+      int playerChunkX = static_cast<int>(std::floor(camera.GetPosition().x / 16.0f));
+      int playerChunkZ = static_cast<int>(std::floor(camera.GetPosition().z / 16.0f));
+      
+      std::vector<uint8_t> gridData;
+      int sx, sy, sz, ox, oz;
+      chunkManager.GetVoxelGridData(playerChunkX, playerChunkZ, radius, gridData, sx, sy, sz, ox, oz);
+      
+      m_vulkanRaytracer->UpdateVoxelGrid(gridData, sx, sy, sz, ox, oz);
+      
+      glm::mat4 invView = glm::inverse(camera.GetViewMatrix());
+      glm::mat4 invProj = glm::inverse(camera.GetProjectionMatrix());
+      glm::vec3 sunDir = glm::normalize(glm::vec3(0.5f, 0.8f, -0.5f));
+      
+      m_vulkanRaytracer->RenderFrame(commandBuffer, invView, invProj, camera.GetPosition(), sunDir);
+  } else {
+
   VkRenderPassBeginInfo renderPassInfo{};
+
   renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-  renderPassInfo.renderPass = m_swapchain->GetRenderPass();
-  renderPassInfo.framebuffer = m_swapchain->GetFramebuffers()[imageIndex];
+  renderPassInfo.renderPass = m_mainRenderPass;
+  renderPassInfo.framebuffer = m_mainFramebuffer;
   renderPassInfo.renderArea.offset = {0, 0};
   renderPassInfo.renderArea.extent = m_swapchain->GetExtent();
 
@@ -534,10 +687,13 @@ void Renderer::RecordCommandBuffer(VkCommandBuffer commandBuffer,
     if (chunk.indexCount == 0)
       continue;
 
-    // Frustum AABB test
-    glm::vec3 minAABB(chunk.x * 16.0f, chunk.minY, chunk.z * 16.0f);
-    glm::vec3 maxAABB(chunk.x * 16.0f + 16.0f, chunk.maxY,
-                      chunk.z * 16.0f + 16.0f);
+    // Frustum AABB test with a 2-chunk margin to prevent false culling at
+    // screen edges
+    const float margin = 16.0f;
+    glm::vec3 minAABB(chunk.x * 16.0f - margin, chunk.minY - margin,
+                      chunk.z * 16.0f - margin);
+    glm::vec3 maxAABB(chunk.x * 16.0f + 16.0f + margin, chunk.maxY + margin,
+                      chunk.z * 16.0f + 16.0f + margin);
 
     bool inside = true;
     for (int i = 0; i < 6; ++i) {
@@ -585,6 +741,9 @@ void Renderer::RecordCommandBuffer(VkCommandBuffer commandBuffer,
   scissor.extent = {m_width, m_height};
   vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
+  // --- DRAW SKYBOX FIRST ---
+  m_skybox->Draw(commandBuffer, camera.GetViewMatrix(), camera.GetProjectionMatrix());
+
   vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                     m_graphicsPipeline);
   vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -620,23 +779,27 @@ void Renderer::RecordCommandBuffer(VkCommandBuffer commandBuffer,
     VkBuffer vertexBuffers[] = {m_globalVertexBuffer};
     VkDeviceSize offsets[] = {0};
     vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
-    vkCmdBindIndexBuffer(commandBuffer, m_globalIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
-    
+    vkCmdBindIndexBuffer(commandBuffer, m_globalIndexBuffer, 0,
+                         VK_INDEX_TYPE_UINT32);
+
     for (auto *chunk : chunksToRender) {
       if (!chunk->isVisible)
         continue;
 
       metrics.chunksRendered++;
-      metrics.verticesRendered += chunk->indexCount; // Actually indices rendered
+      metrics.verticesRendered +=
+          chunk->indexCount; // Actually indices rendered
 
       glm::vec4 pushData(chunk->x * 16.0f, chunk->y * 16.0f, chunk->z * 16.0f,
                          0.0f);
       vkCmdPushConstants(commandBuffer, m_pipelineLayout,
                          VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::vec4),
                          &pushData);
-      
+
       // Use offsets from sub-allocations
-      vkCmdDrawIndexed(commandBuffer, chunk->indexCount, 1, chunk->indexAllocation.start, chunk->vertexAllocation.start, 0);
+      vkCmdDrawIndexed(commandBuffer, chunk->indexCount, 1,
+                       chunk->indexAllocation.start,
+                       chunk->vertexAllocation.start, 0);
     }
   }
 
@@ -657,8 +820,10 @@ void Renderer::RecordCommandBuffer(VkCommandBuffer commandBuffer,
   for (auto *chunk : chunksToRender) {
     vkCmdBeginQuery(commandBuffer, m_queryPool, chunk->queryIndex, 0);
 
-    // Expand AABB slightly to prevent self-occlusion Z-fighting which causes flapping
-    glm::vec4 minPos(chunk->x * 16.0f - 0.2f, chunk->minY - 0.2f, chunk->z * 16.0f - 0.2f, 0.0f);
+    // Expand AABB slightly to prevent self-occlusion Z-fighting which causes
+    // flapping
+    glm::vec4 minPos(chunk->x * 16.0f - 0.2f, chunk->minY - 0.2f,
+                     chunk->z * 16.0f - 0.2f, 0.0f);
     glm::vec4 maxPos(chunk->x * 16.0f + 16.2f, chunk->maxY + 0.2f,
                      chunk->z * 16.0f + 16.2f, 0.0f);
 
@@ -675,7 +840,86 @@ void Renderer::RecordCommandBuffer(VkCommandBuffer commandBuffer,
 
   m_queriesIssued = true;
 
+  vkCmdEndRenderPass(commandBuffer);
+
+  // --- RAYTRACING SHADOW PASS --- (Removed, raytracer handles everything)
+
+  // 2. BLUR PASS (Horizontal)
+  VkRenderPassBeginInfo blurPassInfo{};
+  blurPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+  blurPassInfo.renderPass = m_blurRenderPass;
+  blurPassInfo.framebuffer = m_blurFramebuffer;
+  blurPassInfo.renderArea.offset = {0, 0};
+  blurPassInfo.renderArea.extent = m_swapchain->GetExtent();
+  
+  vkCmdBeginRenderPass(commandBuffer, &blurPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+  vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_blurPipeline);
+  
+  vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+  vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+  
+  vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_blurPipelineLayout, 0, 1, &m_blurDescriptorSet, 0, nullptr);
+  
+  glm::vec2 blurDir = {1.0f / (float)m_swapchain->GetExtent().width, 0.0f};
+  vkCmdPushConstants(commandBuffer, m_blurPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(glm::vec2), &blurDir);
+  vkCmdDraw(commandBuffer, 3, 1, 0, 0); // Fullscreen triangle
+  vkCmdEndRenderPass(commandBuffer);
+  
+  // 3. COMPOSITE PASS (Vertical blur + Add + Tone map)
+  } // End of else (metrics.enableRaytracing) block
+
+  // 4. DRAW TO SWAPCHAIN (COMPOSITE OR RAYTRACE UI)
+  VkRenderPassBeginInfo compPassInfo{};
+  compPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+  compPassInfo.renderPass = m_swapchain->GetRenderPass();
+  compPassInfo.framebuffer = m_swapchain->GetFramebuffers()[imageIndex];
+  compPassInfo.renderArea.offset = {0, 0};
+  compPassInfo.renderArea.extent = m_swapchain->GetExtent();
+  
+  std::array<VkClearValue, 1> compClear{};
+  compClear[0].color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+  compPassInfo.clearValueCount = 1;
+  compPassInfo.pClearValues = compClear.data();
+
+  vkCmdBeginRenderPass(commandBuffer, &compPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+  if (!metrics.enableRaytracing) {
+      vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_compositePipeline);
+      
+      VkViewport viewport{};
+      viewport.width = static_cast<float>(m_swapchain->GetExtent().width);
+      viewport.height = static_cast<float>(m_swapchain->GetExtent().height);
+      viewport.minDepth = 0.0f;
+      viewport.maxDepth = 1.0f;
+      vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+      
+      VkRect2D scissor{};
+      scissor.offset = {0, 0};
+      scissor.extent = m_swapchain->GetExtent();
+      vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+      
+      vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_compositePipelineLayout, 0, 1, &m_compositeDescriptorSet, 0, nullptr);
+      
+      glm::vec2 blurDir = {1.0f, 0.0f};
+      vkCmdPushConstants(commandBuffer, m_compositePipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(glm::vec2), &blurDir);
+      vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+  }
+
+  // 5. DRAW UI
+  if (metrics.enableRaytracing && m_raytraceDescriptorSet) {
+      ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+      ImGui::SetNextWindowSize(ImVec2((float)m_width, (float)m_height));
+      ImGui::SetNextWindowBgAlpha(1.0f);
+      ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+      ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+      ImGui::Begin("RaytracingOutput", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoBackground);
+      ImGui::Image((ImTextureID)m_raytraceDescriptorSet, ImVec2((float)m_width, (float)m_height));
+      ImGui::End();
+      ImGui::PopStyleVar(2);
+  }
+
   m_debugUI->Draw(metrics);
+
   ImGui::Render();
   ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), commandBuffer);
 
@@ -687,7 +931,9 @@ void Renderer::RecordCommandBuffer(VkCommandBuffer commandBuffer,
 }
 
 bool Renderer::DrawFrame(const mc::core::Camera &camera, float time,
-                         mc::core::EngineMetrics &metrics) {
+                         mc::core::EngineMetrics &metrics, mc::world::ChunkManager &chunkManager) {
+
+  PROFILE_SCOPE("Renderer::DrawFrame");
   static int frame_count = 0;
   if (frame_count < 3) {
     LOGZILLA_INFO("DrawFrame %d", frame_count);
@@ -696,10 +942,6 @@ bool Renderer::DrawFrame(const mc::core::Camera &camera, float time,
 
   vkWaitForFences(m_context.GetDevice(), 1, &m_inFlightFence, VK_TRUE,
                   UINT64_MAX);
-
-  // Process pending chunks FIRST, so if a chunk is loaded and then instantly unloaded
-  // (or vice-versa), it is properly added to the map before toDelete processes it.
-  ProcessPendingChunks();
 
   // Safe to process pending deletions because GPU is idle for this frame
   std::vector<glm::ivec3> toDelete;
@@ -712,7 +954,8 @@ bool Renderer::DrawFrame(const mc::core::Camera &camera, float time,
   for (const auto &pos : toDelete) {
     auto it = m_chunkRenderData.find(pos);
     if (it != m_chunkRenderData.end()) {
-      m_garbageQueue.push_back({it->second.vertexAllocation, it->second.indexAllocation});
+      m_garbageQueue.push_back(
+          {it->second.vertexAllocation, it->second.indexAllocation});
       m_freeQueryIndices.push_back(it->second.queryIndex);
       m_chunkRenderData.erase(it);
     }
@@ -722,16 +965,18 @@ bool Renderer::DrawFrame(const mc::core::Camera &camera, float time,
   int garbageProcessed = 0;
   while (!m_garbageQueue.empty() && garbageProcessed < 128) {
     auto &garbage = m_garbageQueue.back();
-    if (garbage.vertexAlloc.valid) m_vertexAllocator.Free(garbage.vertexAlloc);
-    if (garbage.indexAlloc.valid) m_indexAllocator.Free(garbage.indexAlloc);
+    if (garbage.vertexAlloc.valid)
+      m_vertexAllocator.Free(garbage.vertexAlloc);
+    if (garbage.indexAlloc.valid)
+      m_indexAllocator.Free(garbage.indexAlloc);
     m_garbageQueue.pop_back();
     garbageProcessed++;
   }
 
   // Read back occlusion queries from last frame (since GPU is idle)
   if (m_queriesIssued) {
-    // Reset all results to 1 (visible) so chunks outside frustum default to visible
-    // and won't flicker when they enter the frustum.
+    // Reset all results to 1 (visible) so chunks outside frustum default to
+    // visible and won't flicker when they enter the frustum.
     std::fill(m_queryResults.begin(), m_queryResults.end(), 1);
 
     for (uint32_t qIdx : m_issuedQueries) {
@@ -749,10 +994,17 @@ bool Renderer::DrawFrame(const mc::core::Camera &camera, float time,
 
   vkResetFences(m_context.GetDevice(), 1, &m_inFlightFence);
 
+  // Issue pending chunk deletions
+  if (!m_deletionQueue.empty()) {
+      // ...
+  }
+
+
+
   uint32_t imageIndex;
-  VkResult result = vkAcquireNextImageKHR(m_context.GetDevice(), m_swapchain->GetSwapchain(),
-                                          UINT64_MAX, m_imageAvailableSemaphore,
-                                          VK_NULL_HANDLE, &imageIndex);
+  VkResult result = vkAcquireNextImageKHR(
+      m_context.GetDevice(), m_swapchain->GetSwapchain(), UINT64_MAX,
+      m_imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
 
   if (result == VK_ERROR_OUT_OF_DATE_KHR) {
     return false;
@@ -767,7 +1019,7 @@ bool Renderer::DrawFrame(const mc::core::Camera &camera, float time,
   memcpy(m_uniformBufferMapped, &ubo, sizeof(ubo));
 
   vkResetCommandBuffer(m_commandBuffers[0], 0);
-  RecordCommandBuffer(m_commandBuffers[0], imageIndex, camera, time, metrics);
+  RecordCommandBuffer(m_commandBuffers[0], imageIndex, camera, time, metrics, chunkManager);
 
   VkSubmitInfo submitInfo{};
   submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -828,6 +1080,18 @@ void Renderer::RecreateSwapchain(int width, int height) {
   m_height = height;
 
   m_swapchain->Recreate(width, height);
+  
+  if (m_vulkanRaytracer) {
+      m_vulkanRaytracer->Resize(width, height);
+      if (m_raytraceDescriptorSet) {
+          ImGui_ImplVulkan_RemoveTexture(m_raytraceDescriptorSet);
+      }
+      m_raytraceDescriptorSet = ImGui_ImplVulkan_AddTexture(
+          m_vulkanRaytracer->GetOutputSampler(),
+          m_vulkanRaytracer->GetOutputImageView(),
+          VK_IMAGE_LAYOUT_GENERAL
+      );
+  }
 }
 
 void Renderer::UnloadChunk(int cx, int cz) {
@@ -837,103 +1101,128 @@ void Renderer::UnloadChunk(int cx, int cz) {
   }
 }
 
-void Renderer::ProcessPendingChunks() {
-  std::lock_guard<std::mutex> lock(m_readyRenderDataMutex);
-  for (auto &data : m_readyRenderData) {
-    glm::ivec3 pos(data.x, data.y, data.z);
+void Renderer::ProcessPendingChunks(VkCommandBuffer commandBuffer, uint32_t imageIndex) {
+  std::vector<mc::world::ChunkMesh> meshesToUpload;
+  {
+    std::lock_guard<std::mutex> lock(m_pendingUploadsMutex);
+    int count = 0;
+    while (!m_pendingMeshUploads.empty() && count < 8) { // Max 8 chunks per frame
+      meshesToUpload.push_back(std::move(m_pendingMeshUploads.back()));
+      m_pendingMeshUploads.pop_back();
+      count++;
+    }
+  }
 
-    // If there was an old chunk at this position, we should clean it up
+  if (meshesToUpload.empty()) {
+    m_stagingBufferOffsets[imageIndex] = 0; // Reset offset for next use
+    return;
+  }
+
+  VkDeviceSize currentOffset = 0;
+  char* stagingPtr = static_cast<char*>(m_stagingBuffersMapped[imageIndex]);
+  const VkDeviceSize maxStagingSize = 8 * 1024 * 1024;
+
+  for (const auto& mesh : meshesToUpload) {
+    uint32_t vertexCount = static_cast<uint32_t>(mesh.vertices.size());
+    uint32_t indexCount = static_cast<uint32_t>(mesh.indices.size());
+
+    VkDeviceSize vertexSize = vertexCount * sizeof(mc::render::Vertex);
+    VkDeviceSize indexSize = indexCount * sizeof(uint32_t);
+
+    if (currentOffset + vertexSize + indexSize > maxStagingSize) {
+      LOGZILLA_WARN("Staging buffer full! Skipping remaining chunks this frame.");
+      break;
+    }
+
+    auto vertexAlloc = m_vertexAllocator.Allocate(vertexCount);
+    auto indexAlloc = m_indexAllocator.Allocate(indexCount);
+
+    if (!vertexAlloc.valid || !indexAlloc.valid) {
+      LOGZILLA_ERROR("Out of sub-allocated VRAM!");
+      if (vertexAlloc.valid) m_vertexAllocator.Free(vertexAlloc);
+      if (indexAlloc.valid) m_indexAllocator.Free(indexAlloc);
+      continue;
+    }
+
+    // Copy to mapped staging buffer
+    memcpy(stagingPtr + currentOffset, mesh.vertices.data(), vertexSize);
+    VkDeviceSize vOffset = currentOffset;
+    currentOffset += vertexSize;
+
+    memcpy(stagingPtr + currentOffset, mesh.indices.data(), indexSize);
+    VkDeviceSize iOffset = currentOffset;
+    currentOffset += indexSize;
+
+    // Record copy commands
+    VkBufferCopy vCopy{};
+    vCopy.srcOffset = vOffset;
+    vCopy.dstOffset = vertexAlloc.start * sizeof(mc::render::Vertex);
+    vCopy.size = vertexSize;
+    vkCmdCopyBuffer(commandBuffer, m_stagingBuffers[imageIndex], m_globalVertexBuffer, 1, &vCopy);
+
+    VkBufferCopy iCopy{};
+    iCopy.srcOffset = iOffset;
+    iCopy.dstOffset = indexAlloc.start * sizeof(uint32_t);
+    iCopy.size = indexSize;
+    vkCmdCopyBuffer(commandBuffer, m_stagingBuffers[imageIndex], m_globalIndexBuffer, 1, &iCopy);
+
+    // Save render data so we can use it
+    ChunkRenderData renderData;
+    renderData.x = mesh.x;
+    renderData.y = mesh.y;
+    renderData.z = mesh.z;
+    renderData.minY = mesh.minY;
+    renderData.maxY = mesh.maxY;
+    renderData.indexCount = indexCount;
+    renderData.vertexAllocation = vertexAlloc;
+    renderData.indexAllocation = indexAlloc;
+    renderData.isVisible = true;
+
+    glm::ivec3 pos(mesh.x, mesh.y, mesh.z);
     auto it = m_chunkRenderData.find(pos);
     if (it != m_chunkRenderData.end()) {
-      m_garbageQueue.push_back({it->second.vertexAllocation, it->second.indexAllocation});
+      m_garbageQueue.push_back(
+          {it->second.vertexAllocation, it->second.indexAllocation});
 
       // Preserve query index
-      data.queryIndex = it->second.queryIndex;
-      data.isVisible = it->second.isVisible;
+      renderData.queryIndex = it->second.queryIndex;
+      renderData.isVisible = it->second.isVisible;
     } else {
       if (!m_freeQueryIndices.empty()) {
-        data.queryIndex = m_freeQueryIndices.back();
+        renderData.queryIndex = m_freeQueryIndices.back();
         m_freeQueryIndices.pop_back();
       } else {
-        data.queryIndex = 0; // Fallback
+        renderData.queryIndex = 0; // Fallback
       }
     }
 
-    m_chunkRenderData[pos] = data;
+    m_chunkRenderData[pos] = renderData;
   }
-  m_readyRenderData.clear();
+  
+  m_stagingBufferOffsets[imageIndex] = currentOffset;
+  
+  // Pipeline barrier to ensure transfer is done before vertex input read
+  VkMemoryBarrier memoryBarrier{};
+  memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  memoryBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  memoryBarrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT;
+
+  vkCmdPipelineBarrier(
+      commandBuffer,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+      0,
+      1, &memoryBarrier,
+      0, nullptr,
+      0, nullptr);
 }
 
 void Renderer::UploadMeshAsync(const mc::world::ChunkMesh &mesh) {
   if (mesh.vertices.empty() || mesh.indices.empty())
     return;
 
-  uint32_t vertexCount = static_cast<uint32_t>(mesh.vertices.size());
-  uint32_t indexCount = static_cast<uint32_t>(mesh.indices.size());
-
-  auto vertexAlloc = m_vertexAllocator.Allocate(vertexCount);
-  auto indexAlloc = m_indexAllocator.Allocate(indexCount);
-
-  if (!vertexAlloc.valid || !indexAlloc.valid) {
-    // Out of memory in our giant buffers!
-    LOGZILLA_ERROR("Out of sub-allocated VRAM! Vertices: %d, Indices: %d", vertexAlloc.valid, indexAlloc.valid);
-    if (vertexAlloc.valid) m_vertexAllocator.Free(vertexAlloc);
-    if (indexAlloc.valid) m_indexAllocator.Free(indexAlloc);
-    return;
-  }
-
-  ChunkRenderData renderData;
-  renderData.x = mesh.x;
-  renderData.y = mesh.y;
-  renderData.z = mesh.z;
-  renderData.minY = mesh.minY;
-  renderData.maxY = mesh.maxY;
-  renderData.indexCount = indexCount;
-  renderData.vertexAllocation = vertexAlloc;
-  renderData.indexAllocation = indexAlloc;
-
-  // Vertex Buffer (Staging)
-  VkDeviceSize vertexBufferSize = sizeof(mesh.vertices[0]) * vertexCount;
-  VkBuffer vertexStagingBuffer;
-  VkDeviceMemory vertexStagingBufferMemory;
-  VulkanBuffer::CreateBuffer(m_context, vertexBufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-               vertexStagingBuffer, vertexStagingBufferMemory);
-  
-  void *vData;
-  vkMapMemory(m_context.GetDevice(), vertexStagingBufferMemory, 0, vertexBufferSize, 0, &vData);
-  memcpy(vData, mesh.vertices.data(), (size_t)vertexBufferSize);
-  vkUnmapMemory(m_context.GetDevice(), vertexStagingBufferMemory);
-  
-  VkDeviceSize dstVertexOffset = vertexAlloc.start * sizeof(mc::render::Vertex);
-  VulkanBuffer::CopyBuffer(m_context, vertexStagingBuffer,  m_globalVertexBuffer,  vertexBufferSize,  0,  dstVertexOffset, m_graphicsQueueMutex);
-  
-  vkDestroyBuffer(m_context.GetDevice(), vertexStagingBuffer, nullptr);
-  vkFreeMemory(m_context.GetDevice(), vertexStagingBufferMemory, nullptr);
-
-  // Index Buffer (Staging)
-  VkDeviceSize indexBufferSize = sizeof(mesh.indices[0]) * indexCount;
-  VkBuffer indexStagingBuffer;
-  VkDeviceMemory indexStagingBufferMemory;
-  VulkanBuffer::CreateBuffer(m_context, indexBufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-               indexStagingBuffer, indexStagingBufferMemory);
-               
-  void *iData;
-  vkMapMemory(m_context.GetDevice(), indexStagingBufferMemory, 0, indexBufferSize, 0, &iData);
-  memcpy(iData, mesh.indices.data(), (size_t)indexBufferSize);
-  vkUnmapMemory(m_context.GetDevice(), indexStagingBufferMemory);
-  
-  VkDeviceSize dstIndexOffset = indexAlloc.start * sizeof(uint32_t);
-  VulkanBuffer::CopyBuffer(m_context, indexStagingBuffer,  m_globalIndexBuffer,  indexBufferSize,  0,  dstIndexOffset, m_graphicsQueueMutex);
-  
-  vkDestroyBuffer(m_context.GetDevice(), indexStagingBuffer, nullptr);
-  vkFreeMemory(m_context.GetDevice(), indexStagingBufferMemory, nullptr);
-
-  std::lock_guard<std::mutex> lock(m_readyRenderDataMutex);
-  m_readyRenderData.push_back(renderData);
+  std::lock_guard<std::mutex> lock(m_pendingUploadsMutex);
+  m_pendingMeshUploads.push_back(mesh);
 }
-
 } // namespace mc::render
+

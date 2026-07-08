@@ -1,6 +1,8 @@
 #include "debug_ui.h"
 #include <imgui.h>
 #include <string>
+#include <functional>
+#include "../core/profiler.h"
 
 namespace mc::render {
 
@@ -78,12 +80,48 @@ void DebugUI::Draw(mc::core::EngineMetrics &metrics) {
     ImGui::Separator();
 
     ImGui::SliderInt("Render Distance", &metrics.viewDistance, 2, 64);
+    ImGui::Checkbox("Enable CUDA Raytracing (3D DDA)", &metrics.enableRaytracing);
 
     ImGui::Dummy(ImVec2(0, 20)); // Spacer
 
     if (ImGui::Button("Close Settings", ImVec2(200, 40))) {
       metrics.showSettings = false;
     }
+    ImGui::End();
+  }
+
+  // 5. Profiler
+  if (metrics.showProfiler) {
+    ImGui::SetNextWindowSize(ImVec2(600, 400), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Engine Profiler (F3+P)", &metrics.showProfiler);
+    
+    if (ImGui::BeginTable("ProfilerTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable)) {
+      ImGui::TableSetupColumn("Scope Name");
+      ImGui::TableSetupColumn("Time (ms)");
+      ImGui::TableSetupColumn("Time (ns)");
+      ImGui::TableSetupColumn("Thread Hash");
+      ImGui::TableHeadersRow();
+
+      const auto& results = mc::core::Profiler::Get().GetResults();
+      for (const auto& result : results) {
+        ImGui::TableNextRow();
+        
+        ImGui::TableNextColumn();
+        ImGui::Text("%s", result.name);
+        
+        ImGui::TableNextColumn();
+        ImGui::Text("%.4f", result.durationNs / 1000000.0);
+        
+        ImGui::TableNextColumn();
+        ImGui::Text("%lld", result.durationNs);
+        
+        ImGui::TableNextColumn();
+        std::hash<std::thread::id> hasher;
+        ImGui::Text("%zu", hasher(result.threadId));
+      }
+      ImGui::EndTable();
+    }
+    
     ImGui::End();
   }
 }
