@@ -1,6 +1,13 @@
 # Minecraft-2
 
-> A Minecraft-inspired voxel engine built from scratch using **Assembly**, **C++**, **AVX2**, and **Vulkan**.
+> A Minecraft-inspired voxel engine built from scratch using **C++**, **x86-64 Assembly** (with **AVX2**), and **Vulkan**.
+
+> [!WARNING]
+> **Personal & Non-Commercial Project**
+>
+> This project is developed strictly for educational purposes. The sole objective of **Minecraft-2** is to push the limits of performance while improving my skills in **C++** and **Assembly**, exploring both low-level hardware optimization and complex engine architecture.
+>
+> This project is **not intended for commercial use** and will never be sold or monetized. It exists purely for the love of programming, optimization, computer graphics, and the kind of digital masochism that comes with writing half an engine in assembly.
 
 ---
 
@@ -10,7 +17,7 @@
 * Infinite procedural terrain
 * Multi-threaded chunk generation
 * Greedy meshing
-* Handwritten x86-64 Assembly optimizations
+* Handwritten x86-64 Assembly (AVX2) optimizations
 * AVX2 SIMD acceleration
 * Procedurally generated Sun™
 * Software ray tracing (3D DDA, GPU-accelerated)
@@ -56,7 +63,7 @@ Current development targets:
 
 ---
 
-## 💻 Platform & Requirements
+## Platform & Requirements
 
 ### Tested on
 
@@ -64,6 +71,7 @@ Current development targets:
 
 ### Recommended Hardware
 
+* OS: Windows 10/11
 * x86-64 processor with **AVX2** support
 * Dedicated GPU with **Vulkan 1.3** support
 * 512 MB RAM minimum
@@ -97,6 +105,10 @@ Sometimes all three at once.
 
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the GPLv3 License.
 
 Except **The Sun™**, which has its own legal department.
+
+
+---
+Engineered by Vitor.
